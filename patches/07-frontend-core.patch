@@ -1,0 +1,866 @@
+diff --git a/src/modules/chat/ChatInterface.tsx b/src/modules/chat/ChatInterface.tsx
+index 272440b4..74c63935 100644
+--- a/src/modules/chat/ChatInterface.tsx
++++ b/src/modules/chat/ChatInterface.tsx
+@@ -477,7 +477,9 @@ function ChatInterface({
+         ? t('messageTypes.codex')
+         : provider === 'opencode'
+             ? t('messageTypes.opencode', { defaultValue: 'OpenCode' })
+-          : t('messageTypes.claude');
++          : provider === 'pi'
++              ? t('messageTypes.pi', { defaultValue: 'Pi' })
++            : t('messageTypes.claude');
+ 
+   if (!selectedProject) {
+     return (
+diff --git a/src/modules/chat/export/buildTranscriptMarkdown.ts b/src/modules/chat/export/buildTranscriptMarkdown.ts
+index 5e4d651d..de116f8c 100644
+--- a/src/modules/chat/export/buildTranscriptMarkdown.ts
++++ b/src/modules/chat/export/buildTranscriptMarkdown.ts
+@@ -15,6 +15,7 @@ const PROVIDER_LABELS: Record<string, string> = {
+   codex: 'Codex',
+   cursor: 'Cursor',
+   opencode: 'OpenCode',
++  pi: 'Pi',
+ };
+ 
+ /** Fenced blocks need a longer fence than anything they contain. */
+diff --git a/src/modules/chat/hooks/useChatMessages.ts b/src/modules/chat/hooks/useChatMessages.ts
+index 030e9233..9bed21c2 100644
+--- a/src/modules/chat/hooks/useChatMessages.ts
++++ b/src/modules/chat/hooks/useChatMessages.ts
+@@ -7,7 +7,9 @@ import type { ChatMessage, LiveTaskStatus, NormalizedMessage, SubagentActivity }
+ import { formatUsageLimitText } from '@/modules/chat/utils/chatFormatting';
+ 
+ function formatToolResultContent(content: unknown): string {
+-  const text = typeof content === 'string' ? content : JSON.stringify(content);
++  // JSON.stringify(undefined) returns undefined (not a string), so a
++  // tool_result row without a content payload would crash the `.trim()` below.
++  const text = typeof content === 'string' ? content : (JSON.stringify(content) ?? '');
+   const toolUseErrorMatch = /^<tool_use_error>([\s\S]*)<\/tool_use_error>$/.exec(text.trim());
+   return toolUseErrorMatch ? toolUseErrorMatch[1] : text;
+ }
+diff --git a/src/modules/chat/hooks/useChatProviderState.ts b/src/modules/chat/hooks/useChatProviderState.ts
+index d2e3327c..b868540d 100644
+--- a/src/modules/chat/hooks/useChatProviderState.ts
++++ b/src/modules/chat/hooks/useChatProviderState.ts
+@@ -36,9 +36,12 @@ const FALLBACK_DEFAULT_MODEL: Record<LLMProvider, string> = {
+   // any other model runs on the CLI's fallback metadata.
+   codex: 'gpt-5.6-sol',
+   opencode: 'anthropic/claude-sonnet-4-5',
++  // pi's catalog is whatever the local CLI reports, so this only covers the
++  // moment before it loads; the server's DEFAULT wins as soon as it arrives.
++  pi: '',
+ };
+ 
+-const PROVIDERS: LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode'];
++const PROVIDERS: LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode', 'pi'];
+ 
+ /** localStorage key holding the user's default model for one provider. */
+ const providerModelStorageKey = (provider: LLMProvider): string => `${provider}-model`;
+@@ -54,6 +57,7 @@ const FALLBACK_PERMISSION_MODES: Record<LLMProvider, PermissionMode[]> = {
+   cursor: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
+   codex: ['default', 'acceptEdits', 'bypassPermissions'],
+   opencode: ['default', 'acceptEdits', 'bypassPermissions', 'plan'],
++  pi: ['default'],
+ };
+ 
+ type ProviderCapabilities = {
+@@ -685,8 +689,18 @@ export function useChatProviderState({ selectedSession, selectedProject: _select
+   }, [sessionSelection, setStoredProviderEffort]);
+ 
+   // The open session's model wins over the per-provider default, so switching
+-  // sessions shows (and sends) what each session actually runs with.
+-  const currentProviderModel = sessionModel ?? providerModels[provider];
++  // sessions shows (and sends) what each session actually runs with — but only
++  // while the current catalog still offers it. A session row outlives its
++  // model whenever the catalog is discovered at runtime: pi reads its CLI, so
++  // a machine that changes gateways leaves rows pointing at models that no
++  // longer answer.
++  const currentProviderModel = useMemo(() => {
++    const catalog = providerModelCatalog[provider];
++    if (sessionModel && (!catalog || catalog.OPTIONS.some((option) => option.value === sessionModel))) {
++      return sessionModel;
++    }
++    return providerModels[provider];
++  }, [providerModelCatalog, provider, providerModels, sessionModel]);
+   const currentProviderEffortOptions = useMemo(() => {
+     return getEffortOptionsForModel(provider, currentProviderModel);
+   }, [currentProviderModel, getEffortOptionsForModel, provider]);
+diff --git a/src/modules/chat/hooks/useSessionStore.ts b/src/modules/chat/hooks/useSessionStore.ts
+index ae515da6..04a9b6cc 100644
+--- a/src/modules/chat/hooks/useSessionStore.ts
++++ b/src/modules/chat/hooks/useSessionStore.ts
+@@ -128,9 +128,10 @@ async function requestSessionHistoryPage(
+ }
+ 
+ /**
+- * Compute merged messages: server + realtime, deduped by id and adjacent
+- * assistant echo (same trimmed text), so finalized stream rows do not stack
+- * on top of the persisted copy before realtime is cleared.
++ * Compute merged messages: server + realtime, deduped by id and by
++ * same-turn assistant echo (same kind, same trimmed text — adjacency not
++ * required), so finalized stream rows do not stack on top of the persisted
++ * copy before realtime is cleared.
+  */
+ function readMessageTime(m: NormalizedMessage): number | null {
+   const time = Date.parse(m.timestamp);
+@@ -233,10 +234,22 @@ function findServerTurnRangeByOrdinal(
+   return { start, end };
+ }
+ 
+-function isAssistantTextEchoedInSameTurnOnServer(
++type AssistantEchoKind = 'text' | 'thinking';
++
++/**
++ * Whether a live row's content already exists in the persisted transcript as a
++ * row of the same kind inside the same user turn.
++ *
++ * Live event-stream rows and persisted transcript rows derive their message ids
++ * from different sources, so `serverIds.has(id)` never matches them — text and
++ * thinking alike are matched by content echo instead. Thinking rows carry no
++ * role on either side, so only text keeps the assistant gate.
++ */
++function isAssistantEchoedInSameTurnOnServer(
+   message: NormalizedMessage,
+   serverMessages: NormalizedMessage[],
+   realtimeMessages: NormalizedMessage[],
++  kind: AssistantEchoKind = 'text',
+ ): boolean {
+   const assistantText = (message.content || '').trim();
+   if (!assistantText) {
+@@ -252,46 +265,141 @@ function isAssistantTextEchoedInSameTurnOnServer(
+   return serverMessages
+     .slice(turnRange.start + 1, turnRange.end)
+     .some((serverMessage) =>
+-      serverMessage.kind === 'text'
+-      && serverMessage.role === 'assistant'
++      serverMessage.kind === kind
++      && (kind !== 'text' || serverMessage.role === 'assistant')
+       && (serverMessage.content || '').trim() === assistantText,
+     );
+ }
+ 
+ /**
+- * After `finalizeStreaming`, the client holds a synthetic assistant `text` row
+- * while the sessions API soon returns the same reply with a different id.
+- * Those sit back-to-back in merged order and look like duplicate bubbles until
+- * A persisted-tail refresh reconciles realtime. Collapse same-text assistant rows and
+- * stream_placeholder → text when content matches.
++ * The rows this dedupe compares, keyed by (kind, trimmed content).
++ *
++ * Thinking rows carry no role on either side, so only text keeps the
++ * assistant gate. Empty content never dedupes.
++ */
++function assistantEchoScopeKey(message: NormalizedMessage): string | null {
++  const content = (message.content || '').trim();
++  if (content.length === 0) {
++    return null;
++  }
++  if (message.kind === 'thinking') {
++    return `thinking\n${content}`;
++  }
++  if (message.kind === 'text' && message.role === 'assistant') {
++    return `text\n${content}`;
++  }
++  return null;
++}
++
++/**
++ * Upgrade a trailing stream delta to its finalized text row.
++ *
++ * A `stream_delta` directly followed by its identical finalized text is
++ * replaced by the text row — the delta was only its live preview. This never
++ * removes content, so it is safe on rows from any single source.
+  */
+-function dedupeAdjacentAssistantEchoes(merged: NormalizedMessage[]): NormalizedMessage[] {
++function finalizeStreamDeltaUpgrades(rows: NormalizedMessage[]): NormalizedMessage[] {
+   const out: NormalizedMessage[] = [];
+-  for (const m of merged) {
++  for (const m of rows) {
+     const prev = out[out.length - 1];
+-    if (prev) {
+-      if (prev.kind === 'stream_delta' && m.kind === 'text' && m.role === 'assistant') {
+-        const ps = (prev.content || '').trim();
+-        const ms = (m.content || '').trim();
+-        if (ps.length > 0 && ps === ms) {
+-          out[out.length - 1] = m;
+-          continue;
+-        }
++    if (
++      prev
++      && prev.kind === 'stream_delta'
++      && m.kind === 'text'
++      && m.role === 'assistant'
++      && (prev.content || '').trim().length > 0
++      && (prev.content || '').trim() === (m.content || '').trim()
++    ) {
++      out[out.length - 1] = m;
++    } else {
++      out.push(m);
++    }
++  }
++  return out;
++}
++
++/**
++ * Drop realtime rows the persisted transcript already owns in the same turn.
++ *
++ * After `finalizeStreaming`, the client holds a synthetic assistant `text`
++ * row while the sessions API soon returns the same reply with a different id,
++ * and live event-stream rows never share a message id with their persisted
++ * twins either — text and thinking alike are matched by content echo. The refresh
++ * that pulls the persisted copy back normally prunes the live one
++ * (`pruneRealtimeSupersededByServer`), but that prune locates the owning turn
++ * by walking chronology, and live rows (stamped when the client received them)
++ * and persisted rows (stamped when the provider wrote them) can interleave
++ * enough to mislocate the turn. When it misses, both copies survive into the
++ * merged view — and they are not adjacent: the timestamp sort weaves each copy
++ * in between the other side's sibling rows (server text, live thinking, live
++ * text, server thinking). The comparison is therefore scoped by turn and,
++ * inside a turn, order-independent — however far before or after its twin a
++ * row sorts.
++ *
++ * Only realtime twins are removed — never a server row, and never a realtime
++ * row without a persisted counterpart. Repeated identical output from one
++ * authoritative source (the model genuinely emitting the same block twice in
++ * one turn) is preserved, so history never loses real content. Rows are only
++ * ever removed, never reordered; a `stream_delta` directly followed by its
++ * identical finalized text is still upgraded to the text row.
++ */
++function dropRealtimeEchoesOfServerRows(
++  merged: NormalizedMessage[],
++  serverIds: ReadonlySet<string>,
++): NormalizedMessage[] {
++  const out: NormalizedMessage[] = [];
++  let turnRows: NormalizedMessage[] = [];
++
++  const flushTurn = (): void => {
++    if (turnRows.length === 0) {
++      return;
++    }
++    // (kind, trimmed content) keys the persisted rows own in this turn.
++    const serverKeys = new Set<string>();
++    for (const row of turnRows) {
++      if (!serverIds.has(row.id)) {
++        continue;
++      }
++      const key = assistantEchoScopeKey(row);
++      if (key !== null) {
++        serverKeys.add(key);
++      }
++    }
++
++    for (const row of turnRows) {
++      const echoKey = assistantEchoScopeKey(row);
++      // Only the realtime twin of an already-persisted row is dropped.
++      if (echoKey !== null && !serverIds.has(row.id) && serverKeys.has(echoKey)) {
++        continue;
+       }
++
++      const prev = out[out.length - 1];
+       if (
+-        prev.kind === 'text'
+-        && m.kind === 'text'
+-        && prev.role === 'assistant'
+-        && m.role === 'assistant'
++        prev
++        && prev.kind === 'stream_delta'
++        && row.kind === 'text'
++        && row.role === 'assistant'
++        && (prev.content || '').trim().length > 0
++        && (prev.content || '').trim() === (row.content || '').trim()
+       ) {
+-        const ms = (m.content || '').trim();
+-        if (ms.length > 0 && ms === (prev.content || '').trim()) {
+-          continue;
+-        }
++        out[out.length - 1] = row;
++      } else {
++        out.push(row);
+       }
+     }
+-    out.push(m);
++
++    turnRows = [];
++  };
++
++  for (const m of merged) {
++    if ((m.kind === 'text' && m.role === 'user') || m.kind === 'tool_use') {
++      flushTurn();
++      out.push(m);
++      continue;
++    }
++    turnRows.push(m);
+   }
++  flushTurn();
+   return out;
+ }
+ 
+@@ -318,14 +426,24 @@ function pruneRealtimeSupersededByServer(
+     }
+ 
+     if (message.kind === 'stream_delta' || message.id === `__streaming_${message.sessionId}`) {
+-      if (isAssistantTextEchoedInSameTurnOnServer(message, serverMessages, realtimeMessages)) {
++      if (isAssistantEchoedInSameTurnOnServer(message, serverMessages, realtimeMessages)) {
+         return false;
+       }
+       return true;
+     }
+ 
+     if (message.kind === 'text' && message.role === 'assistant') {
+-      if (isAssistantTextEchoedInSameTurnOnServer(message, serverMessages, realtimeMessages)) {
++      if (isAssistantEchoedInSameTurnOnServer(message, serverMessages, realtimeMessages)) {
++        return false;
++      }
++      return true;
++    }
++
++    // Live event-stream rows and persisted transcript rows never share a
++    // message id, so thinking is matched by content echo too (same as text);
++    // without this a persisted-tail refresh left every reasoning block doubled.
++    if (message.kind === 'thinking') {
++      if (isAssistantEchoedInSameTurnOnServer(message, serverMessages, realtimeMessages, 'thinking')) {
+         return false;
+       }
+       return true;
+@@ -347,10 +465,12 @@ function pruneRealtimeSupersededByServer(
+ 
+ function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[]): NormalizedMessage[] {
+   if (realtime.length === 0) {
+-    return dedupeAdjacentAssistantEchoes(server);
++    // Persisted rows only: repeated output within one turn is authoritative
++    // content, so nothing is deduped by content in a single-source view.
++    return finalizeStreamDeltaUpgrades(server);
+   }
+   if (server.length === 0) {
+-    return dedupeAdjacentAssistantEchoes(realtime);
++    return finalizeStreamDeltaUpgrades(realtime);
+   }
+ 
+   const serverIds = new Set(server.map((message) => message.id));
+@@ -363,7 +483,7 @@ function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[
+   });
+ 
+   if (extra.length === 0) {
+-    return dedupeAdjacentAssistantEchoes(server);
++    return finalizeStreamDeltaUpgrades(server);
+   }
+ 
+   // Interleave by timestamp so live rows stay with their turn instead of
+@@ -374,10 +494,11 @@ function computeMerged(server: NormalizedMessage[], realtime: NormalizedMessage[
+     (newest, message) => Math.max(newest, readMessageTime(message) ?? 0),
+     0,
+   );
+-  return dedupeAdjacentAssistantEchoes(
++  return dropRealtimeEchoesOfServerRows(
+     [...server, ...extra].sort(
+       (a, b) => readSortTime(a, newestServerTime) - readSortTime(b, newestServerTime),
+     ),
++    serverIds,
+   );
+ }
+ 
+diff --git a/src/modules/chat/modals/CommandResultModal.tsx b/src/modules/chat/modals/CommandResultModal.tsx
+index 00c30822..11bbef3e 100644
+--- a/src/modules/chat/modals/CommandResultModal.tsx
++++ b/src/modules/chat/modals/CommandResultModal.tsx
+@@ -57,6 +57,7 @@ const PROVIDER_LABELS: Record<string, string> = {
+   cursor: 'Cursor',
+   codex: 'Codex',
+   opencode: 'OpenCode',
++  pi: 'Pi',
+ };
+ 
+ const FALLBACK_COMMANDS: CommandEntry[] = [
+diff --git a/src/modules/chat/modals/ModelLibraryPanel.tsx b/src/modules/chat/modals/ModelLibraryPanel.tsx
+index bc078a9a..5c22862e 100644
+--- a/src/modules/chat/modals/ModelLibraryPanel.tsx
++++ b/src/modules/chat/modals/ModelLibraryPanel.tsx
+@@ -26,6 +26,7 @@ const PROVIDERS: Array<{ id: LLMProvider; label: string }> = [
+   { id: 'codex', label: 'Codex' },
+   { id: 'cursor', label: 'Cursor' },
+   { id: 'opencode', label: 'OpenCode' },
++  { id: 'pi', label: 'Pi' },
+ ];
+ 
+ type ModelLibraryPanelProps = {
+diff --git a/src/modules/chat/tests/customModelsOnly.test.tsx b/src/modules/chat/tests/customModelsOnly.test.tsx
+index 7c435380..73ddbdae 100644
+--- a/src/modules/chat/tests/customModelsOnly.test.tsx
++++ b/src/modules/chat/tests/customModelsOnly.test.tsx
+@@ -334,7 +334,7 @@ test('the model picker says which providers list only your models', () => {
+         provider="claude"
+         setProvider={() => {}}
+         textareaRef={{ current: null }}
+-        providerModels={{ claude: 'default', codex: 'gpt-5.6-sol', cursor: 'auto', opencode: '' }}
++        providerModels={{ claude: 'default', codex: 'gpt-5.6-sol', cursor: 'auto', opencode: '', pi: '' }}
+         setProviderModel={() => {}}
+         providerModelCatalog={providerModelCatalog}
+         providerModelActions={createActions(async () => {})}
+diff --git a/src/modules/chat/tests/sessionStoreThinkingEcho.test.tsx b/src/modules/chat/tests/sessionStoreThinkingEcho.test.tsx
+new file mode 100644
+index 00000000..23247095
+--- /dev/null
++++ b/src/modules/chat/tests/sessionStoreThinkingEcho.test.tsx
+@@ -0,0 +1,252 @@
++import assert from 'node:assert/strict';
++
++import { act, renderHook } from '@testing-library/react';
++import { afterEach, beforeEach, describe, it, vi } from 'vitest';
++
++import type { NormalizedMessage } from '@/shared/types';
++
++/**
++ * Live event-stream rows and persisted transcript rows derive their message
++ * ids from different sources, so `serverIds.has(id)` never matches them. Text
++ * and thinking alike are therefore matched by content echo — otherwise every
++ * reasoning block renders twice once the persisted-tail refresh reconciles
++ * realtime.
++ *
++ * The turn locating behind that prune keys off chronology, and live rows
++ * (stamped when the client received them) and persisted rows (stamped when the
++ * provider wrote them) can interleave enough to mislocate the turn. When the
++ * prune misses, the duplicate copies still reach the merged view — woven
++ * between each other's sibling rows rather than adjacent — so the merged-view
++ * dedupe drops same-turn same-kind duplicates by turn scope, not by position.
++ */
++
++const sessionMessages = vi.fn();
++
++vi.mock('@/shared/api', () => ({
++  api: {
++    providers: {
++      sessionMessages: (...args: unknown[]) => sessionMessages(...args),
++    },
++  },
++}));
++
++const text = (id: string, role: 'user' | 'assistant', content: string, timestamp: string): NormalizedMessage => ({
++  id,
++  kind: 'text',
++  role,
++  provider: 'pi',
++  sessionId: 'session-1',
++  content,
++  timestamp,
++} as NormalizedMessage);
++
++// Persisted and live thinking rows carry no role — matching is by content only.
++const thinking = (id: string, content: string, timestamp: string): NormalizedMessage => ({
++  id,
++  kind: 'thinking',
++  provider: 'pi',
++  sessionId: 'session-1',
++  content,
++  timestamp,
++} as NormalizedMessage);
++
++const user = () => text('u1', 'user', 'first prompt', '2026-01-01T00:00:01.000Z');
++const answer = () => text('a1', 'assistant', 'first answer', '2026-01-01T00:00:03.000Z');
++const persistedThinking = () => thinking('p1', 'Let me reason about it.', '2026-01-01T00:00:02.000Z');
++
++const page = (messages: NormalizedMessage[]) => sessionMessages.mockResolvedValue({
++  ok: true,
++  json: async () => ({ data: { messages, total: messages.length, hasMore: false } }),
++});
++
++beforeEach(() => {
++  sessionMessages.mockReset();
++});
++
++afterEach(() => {
++  vi.resetModules();
++});
++
++async function loadedStore() {
++  const { useSessionStore } = await import('@/modules/chat/hooks/useSessionStore');
++  return renderHook(() => useSessionStore());
++}
++
++describe('thinking echoes between live stream and persisted history', () => {
++  it('drops a live thinking row once the persisted transcript holds the same block', async () => {
++    page([user(), answer()]);
++    const { result } = await loadedStore();
++    await act(async () => {
++      await result.current.fetchFromServer('session-1', { limit: 20, offset: 0 });
++    });
++
++    act(() => {
++      result.current.appendRealtime(
++        'session-1',
++        thinking('live-t1', 'Let me reason about it.', '2026-01-01T00:00:04.000Z'),
++      );
++    });
++    assert.equal(result.current.getMessages('session-1').length, 3);
++
++    // The run finished and the JSONL now holds the block under its own id.
++    page([user(), persistedThinking(), answer()]);
++    await act(async () => {
++      await result.current.refreshLatestFromServer('session-1');
++    });
++
++    assert.deepEqual(
++      result.current.getMessages('session-1').map((message) => message.id),
++      ['u1', 'p1', 'a1'],
++    );
++  });
++
++  it('keeps a live thinking row the persisted turn does not repeat', async () => {
++    page([user(), answer()]);
++    const { result } = await loadedStore();
++    await act(async () => {
++      await result.current.fetchFromServer('session-1', { limit: 20, offset: 0 });
++    });
++
++    act(() => {
++      result.current.appendRealtime(
++        'session-1',
++        thinking('live-t2', 'A different line of reasoning.', '2026-01-01T00:00:04.000Z'),
++      );
++    });
++
++    page([user(), persistedThinking(), answer()]);
++    await act(async () => {
++      await result.current.refreshLatestFromServer('session-1');
++    });
++
++    assert.deepEqual(
++      result.current.getMessages('session-1').map((message) => message.id),
++      ['u1', 'p1', 'a1', 'live-t2'],
++    );
++  });
++
++  it('collapses adjacent persisted and live thinking rows with identical content', async () => {
++    page([user(), persistedThinking(), answer()]);
++    const { result } = await loadedStore();
++    await act(async () => {
++      await result.current.fetchFromServer('session-1', { limit: 20, offset: 0 });
++    });
++
++    // Same block seen twice back-to-back in merged order, before any refresh
++    // can reconcile realtime: only the content ties them together.
++    act(() => {
++      result.current.appendRealtime(
++        'session-1',
++        thinking('live-t1', 'Let me reason about it.', '2026-01-01T00:00:02.000Z'),
++      );
++    });
++
++    assert.deepEqual(
++      result.current.getMessages('session-1').map((message) => message.id),
++      ['u1', 'p1', 'a1'],
++    );
++  });
++
++  it('still drops a live assistant text row the persisted turn already holds', async () => {
++    page([user(), answer()]);
++    const { result } = await loadedStore();
++    await act(async () => {
++      await result.current.fetchFromServer('session-1', { limit: 20, offset: 0 });
++    });
++
++    act(() => {
++      result.current.appendRealtime(
++        'session-1',
++        text('live-a1', 'assistant', 'first answer', '2026-01-01T00:00:04.000Z'),
++      );
++    });
++
++    await act(async () => {
++      await result.current.refreshLatestFromServer('session-1');
++    });
++
++    assert.deepEqual(
++      result.current.getMessages('session-1').map((message) => message.id),
++      ['u1', 'a1'],
++    );
++  });
++
++  it('drops interleaved server/live echoes that never sort next to their twin', async () => {
++    // The completion flash: live rows are stamped when the client received
++    // them and persisted rows when the provider wrote them, so the timestamp
++    // sort weaves each copy between the other side's sibling rows —
++    // server text, live thinking, live text, server thinking — and no
++    // duplicate pair is adjacent.
++    page([
++      user(),
++      text('a1', 'assistant', 'first answer', '2026-01-01T00:00:03.000Z'),
++      thinking('p1', 'Let me reason about it.', '2026-01-01T00:00:04.500Z'),
++    ]);
++    const { result } = await loadedStore();
++    await act(async () => {
++      await result.current.fetchFromServer('session-1', { limit: 20, offset: 0 });
++    });
++
++    act(() => {
++      result.current.appendRealtime(
++        'session-1',
++        thinking('live-t1', 'Let me reason about it.', '2026-01-01T00:00:03.500Z'),
++      );
++      result.current.appendRealtime(
++        'session-1',
++        text('live-a1', 'assistant', 'first answer', '2026-01-01T00:00:04.000Z'),
++      );
++    });
++
++    const merged = result.current.getMessages('session-1');
++    // The persisted rows win over their live twins — the server copy carries
++    // the stable id the rest of the app addresses rows by.
++    assert.deepEqual(merged.map((message) => message.id), ['u1', 'a1', 'p1']);
++    const echoedContents = merged
++      .map((message) => `${message.kind}:${(message.content || '').trim()}`);
++    assert.equal(new Set(echoedContents).size, echoedContents.length);
++  });
++
++  it('keeps identical replies that belong to different turns', async () => {
++    page([
++      user(),
++      text('a1', 'assistant', 'same reply', '2026-01-01T00:00:03.000Z'),
++      text('u2', 'user', 'second prompt', '2026-01-01T00:00:05.000Z'),
++      text('a2', 'assistant', 'same reply', '2026-01-01T00:00:07.000Z'),
++    ]);
++    const { result } = await loadedStore();
++    await act(async () => {
++      await result.current.fetchFromServer('session-1', { limit: 20, offset: 0 });
++    });
++
++    // A user prompt starts a new echo scope: two turns answering with the
++    // exact same words are two genuine replies, not a server/live double.
++    assert.deepEqual(
++      result.current.getMessages('session-1').map((message) => message.id),
++      ['u1', 'a1', 'u2', 'a2'],
++    );
++  });
++
++  it('keeps identical rows repeated within one persisted turn', async () => {
++    // The authoritative source may genuinely contain the same block twice in
++    // one turn (a model repeating itself, identical tool captions). Content
++    // dedupe exists only for server-versus-realtime echoes, so a
++    // persisted-only view must render both rows.
++    page([
++      user(),
++      text('a1', 'assistant', 'done', '2026-01-01T00:00:03.000Z'),
++      text('a2', 'assistant', 'done', '2026-01-01T00:00:04.000Z'),
++      thinking('p1', 'short block', '2026-01-01T00:00:05.000Z'),
++      thinking('p2', 'short block', '2026-01-01T00:00:06.000Z'),
++    ]);
++    const { result } = await loadedStore();
++    await act(async () => {
++      await result.current.fetchFromServer('session-1', { limit: 20, offset: 0 });
++    });
++
++    assert.deepEqual(
++      result.current.getMessages('session-1').map((message) => message.id),
++      ['u1', 'a1', 'a2', 'p1', 'p2'],
++    );
++  });
++});
+diff --git a/src/modules/chat/transcript/MessageComponent.tsx b/src/modules/chat/transcript/MessageComponent.tsx
+index 8d65a519..65d17a41 100644
+--- a/src/modules/chat/transcript/MessageComponent.tsx
++++ b/src/modules/chat/transcript/MessageComponent.tsx
+@@ -319,7 +319,9 @@ const MessageComponent = memo(({ message, prevMessage, createDiff, onFileOpen, s
+                           ? t('messageTypes.codex')
+                           : provider === 'opencode'
+                               ? t('messageTypes.opencode', { defaultValue: 'OpenCode' })
+-                              : t('messageTypes.claude'))}
++                              : provider === 'pi'
++                                  ? t('messageTypes.pi', { defaultValue: 'Pi' })
++                                : t('messageTypes.claude'))}
+               </div>
+             </div>
+           )}
+diff --git a/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx b/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx
+index 28b778f0..1e3abfbf 100644
+--- a/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx
++++ b/src/modules/chat/transcript/ProviderSelectionEmptyState.tsx
+@@ -31,6 +31,7 @@ const PROVIDER_META: { id: LLMProvider; name: string }[] = [
+   { id: "codex", name: "OpenAI" },
+   { id: "cursor", name: "Cursor" },
+   { id: "opencode", name: "OpenCode" },
++  { id: "pi", name: "Pi" },
+ ];
+ 
+ const MOD_KEY =
+@@ -78,6 +79,7 @@ function getProviderDisplayName(p: LLMProvider) {
+   if (p === "cursor") return "Cursor";
+   if (p === "codex") return "Codex";
+   if (p === "opencode") return "OpenCode";
++  if (p === "pi") return "Pi";
+   return "Claude";
+ }
+ 
+@@ -329,6 +331,10 @@ export default function ProviderSelectionEmptyState({
+                   model: providerModels.opencode,
+                   defaultValue: "Ready with OpenCode {{model}}",
+                 }),
++                pi: t("providerSelection.readyPrompt.pi", {
++                  model: providerModels.pi,
++                  defaultValue: "Ready with Pi {{model}}",
++                }),
+               }[provider]
+             }
+           </p>
+diff --git a/src/shared/constants.ts b/src/shared/constants.ts
+index 2ddc8141..1a9f64f4 100644
+--- a/src/shared/constants.ts
++++ b/src/shared/constants.ts
+@@ -120,6 +120,7 @@ export const MCP_PROVIDER_NAMES: Record<McpProvider, string> = {
+   cursor: 'Cursor',
+   codex: 'Codex',
+   opencode: 'OpenCode',
++  pi: 'Pi',
+ };
+ 
+ /** Scopes each provider can install an MCP server into; drives the scope selector and validation. */
+@@ -128,6 +129,9 @@ export const MCP_SUPPORTED_SCOPES: Record<McpProvider, McpScope[]> = {
+   cursor: ['user', 'project'],
+   codex: ['user', 'project'],
+   opencode: ['user', 'project'],
++  // pi has no MCP integration yet; the empty lists keep the type total while
++  // gating every scope/transport option off in the form.
++  pi: [],
+ };
+ 
+ /** Transports each provider can talk to an MCP server over; drives the transport selector and validation. */
+@@ -136,6 +140,7 @@ export const MCP_SUPPORTED_TRANSPORTS: Record<McpProvider, McpTransport[]> = {
+   cursor: ['stdio', 'http'],
+   codex: ['stdio', 'http'],
+   opencode: ['stdio', 'http'],
++  pi: [],
+ };
+ 
+ /** Transports offered when configuring a global (provider-agnostic) MCP server. */
+@@ -154,6 +159,7 @@ export const MCP_SUPPORTS_WORKING_DIRECTORY: Record<McpProvider, boolean> = {
+   cursor: false,
+   codex: true,
+   opencode: false,
++  pi: false,
+ };
+ 
+ // ---------------------------
+@@ -224,6 +230,7 @@ export const PROVIDER_PERMISSION_PREFERENCE_KEYS: Record<LLMProvider, UserPrefer
+   cursor: 'cursorPermissions',
+   codex: 'codexPermissions',
+   opencode: 'opencodePermissions',
++  pi: 'piPermissions',
+ };
+ 
+ // ---------------------------
+diff --git a/src/shared/selectedProvider.ts b/src/shared/selectedProvider.ts
+index 222f8607..4e2e717b 100644
+--- a/src/shared/selectedProvider.ts
++++ b/src/shared/selectedProvider.ts
+@@ -16,7 +16,7 @@ import { readUserPreference, writeUserPreference } from '@/shared/userSettings';
+  * choice both reaches every reader at once and follows the user between devices.
+  */
+ 
+-const PROVIDERS: LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode'];
++const PROVIDERS: LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode', 'pi'];
+ 
+ const DEFAULT_PROVIDER: LLMProvider = 'claude';
+ 
+diff --git a/src/shared/types.ts b/src/shared/types.ts
+index 6155d733..f1804308 100644
+--- a/src/shared/types.ts
++++ b/src/shared/types.ts
+@@ -5,7 +5,7 @@ import type { NavigateFunction } from 'react-router-dom';
+ //----------------- LLM PROVIDER MODEL CATALOG ------------
+ 
+ /** Identifies which coding-agent CLI backs a session, project selection or model list. */
+-export type LLMProvider = 'claude' | 'cursor' | 'codex' | 'opencode';
++export type LLMProvider = 'claude' | 'cursor' | 'codex' | 'opencode' | 'pi';
+ 
+ /** One selectable model in a provider's model menu, including its optional reasoning-effort choices. */
+ export type ProviderModelOption = {
+@@ -1423,6 +1423,12 @@ export type ProviderAuthStatus = {
+   subscriptionOverride?: ProviderAuthSubscriptionOverride;
+   /** Version the provider's CLI printed for `--version`; null when unknown, absent until the server has answered. */
+   installedVersion?: string | null;
++  /**
++   * Whether the provider's CLI answered on this machine, as reported by the
++   * backend status endpoint. Absent while the status is loading or the check
++   * failed, so consumers can tell "known to be missing" from "unknown".
++   */
++  installed?: boolean;
+ };
+ 
+ /** The authentication state of every CLI provider at once, keyed by LLMProvider, so onboarding and settings can render each provider's connected, loading and error state from one object returned by useProviderAuthStatus. */
+diff --git a/src/shared/ui/LLMProviderLogo.tsx b/src/shared/ui/LLMProviderLogo.tsx
+index 16bbc489..43cdf6ad 100644
+--- a/src/shared/ui/LLMProviderLogo.tsx
++++ b/src/shared/ui/LLMProviderLogo.tsx
+@@ -3,6 +3,7 @@ import ClaudeLogo from '@/shared/ui/ClaudeLogo';
+ import CodexLogo from '@/shared/ui/CodexLogo';
+ import CursorLogo from '@/shared/ui/CursorLogo';
+ import OpenCodeLogo from '@/shared/ui/OpenCodeLogo';
++import PiLogo from '@/shared/ui/PiLogo';
+ 
+ type LLMProviderLogoProps = {
+   provider?: LLMProvider | string | null;
+@@ -26,5 +27,9 @@ export function LLMProviderLogo({
+     return <OpenCodeLogo className={className} />;
+   }
+ 
++  if (provider === 'pi') {
++    return <PiLogo className={className} />;
++  }
++
+   return <ClaudeLogo className={className} />;
+ }
+diff --git a/src/shared/ui/PiLogo.tsx b/src/shared/ui/PiLogo.tsx
+new file mode 100644
+index 00000000..3751520e
+--- /dev/null
++++ b/src/shared/ui/PiLogo.tsx
+@@ -0,0 +1,29 @@
++type PiLogoProps = {
++  className?: string;
++};
++
++/**
++ * Rendered by the shared LLMProviderLogo when the provider is Pi.
++ *
++ * Pi's own mark: three interlocking squares in its brand palette, traced from
++ * the published logo at https://pi.dev/logo-auto.svg (viewBox 0 0 800 800).
++ * Unlike the single-colour sibling logos this one keeps Pi's three fills, the
++ * same way ClaudeLogo keeps its own brand colour, so the mark stays
++ * recognisable at the 16–24px sizes the provider lists use.
++ */
++const PiLogo = ({ className = 'w-5 h-5' }: PiLogoProps) => (
++  <svg
++    viewBox="0 0 800 800"
++    role="img"
++    aria-label="Pi"
++    className={className}
++    fill="none"
++    xmlns="http://www.w3.org/2000/svg"
++  >
++    <path fill="#F09082" d="M165.29 165.29H517.36V400H400V282.65H165.29Z" />
++    <path fill="#4D9ABF" d="M165.29 282.65H282.65V400H400V517.36H282.65V634.72H165.29Z" />
++    <path fill="#F1BE58" d="M517.36 400H634.72V634.72H517.36Z" />
++  </svg>
++);
++
++export default PiLogo;
+diff --git a/src/shared/userSettings.ts b/src/shared/userSettings.ts
+index cb8b9dad..1fa829fb 100644
+--- a/src/shared/userSettings.ts
++++ b/src/shared/userSettings.ts
+@@ -25,6 +25,7 @@ export type UserPreferences = {
+   cursorPermissions: unknown;
+   codexPermissions: unknown;
+   opencodePermissions: unknown;
++  piPermissions: unknown;
+   codeEditorSettings: unknown;
+   uiPreferences: unknown;
+   selectedProvider: string;
+@@ -62,6 +63,7 @@ const LEGACY_STORAGE_KEYS: Record<UserPreferenceKey, string> = {
+   cursorPermissions: 'cursor-tools-settings',
+   codexPermissions: 'codex-settings',
+   opencodePermissions: 'opencode-settings',
++  piPermissions: 'pi-settings',
+   // Unused: the four code-editor settings never shared one key, so they are
+   // read by readLegacyCodeEditorSettings instead.
+   codeEditorSettings: '',

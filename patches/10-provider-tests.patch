@@ -1,0 +1,1674 @@
+diff --git a/server/modules/providers/README.md b/server/modules/providers/README.md
+index 4cacc2c8..9294cc6c 100644
+--- a/server/modules/providers/README.md
++++ b/server/modules/providers/README.md
+@@ -45,6 +45,7 @@ Current provider ids in this repo are:
+ - `codex`
+ - `cursor`
+ - `opencode`
++- `pi`
+ 
+ Those ids are mirrored in backend unions and frontend provider constants. If
+ adding a new provider, update every place that hardcodes this list.
+@@ -65,7 +66,8 @@ server/modules/providers/list/<provider>/
+   <provider>-session-synchronizer.provider.ts
+ ```
+ 
+-The existing provider folders are `claude`, `codex`, `cursor`, and `opencode`.
++The existing provider folders are `claude`, `codex`, `cursor`, `opencode`, and
++`pi`.
+ 
+ Each provider wrapper owns its SDK/CLI runtime alongside its auth, model, and
+ session facets. Runtime adapters receive registry-backed model and session
+@@ -96,7 +98,7 @@ import the service from `server/modules/providers/index.ts`.
+ 1. Add the provider id everywhere it is part of the contract.
+ 
+ - Update `server/shared/types.ts` `LLMProvider`.
+-- Update `src/types/app.ts` `LLMProvider` if the frontend should know about it.
++- Update `src/shared/types.ts` `LLMProvider` if the frontend should know about it.
+ - Update `server/modules/providers/provider.routes.ts`.
+ - Update `server/modules/agent/agent.routes.ts` if the provider is launchable from the agent runtime.
+ - Update `server/index.ts` if the provider needs runtime boot or shutdown wiring.
+@@ -147,6 +149,9 @@ Current MCP formats in this repo are:
+ | Codex | `.codex/config.toml` | `user`, `project` | `stdio`, `http` |
+ | Cursor | `.cursor/mcp.json` | `user`, `project` | `stdio`, `http` |
+ | OpenCode | `~/.config/opencode/opencode.json` or `<workspace>/opencode.json` (`.jsonc` is read when present) | `user`, `project` | `stdio`, `http` |
++| pi | not applicable | none | none |
++
++pi has no MCP integration; every facet method answers `NOT_SUPPORTED`.
+ 
+ 5. Implement skills.
+ 
+@@ -167,6 +172,7 @@ Current skill discovery roots are:
+ | Codex | `~/.agents/skills`, `~/.codex/skills/.system`, `/etc/codex/skills` | `<workspace>/.agents/skills`, `path.dirname(workspacePath)/.agents/skills`, topmost git root `.agents/skills` | `$` | Overlapping roots are deduplicated before scanning. |
+ | Cursor | `~/.cursor/skills` | `<workspace>/.cursor/skills`, `<workspace>/.agents/skills` | `/` | Uses slash-style commands. |
+ | OpenCode | `~/.config/opencode/skills`, `~/.claude/skills`, `~/.agents/skills` | Cwd-to-topmost-git-root `.opencode/skills`, `.claude/skills`, and `.agents/skills` | `/` | Reuses OpenCode, Claude, and Agents skill locations. Overlapping roots are deduplicated before scanning. |
++| pi | `~/.pi/agent/skills`, plus every directory listed in the `skills` array of `~/.pi/agent/settings.json` | `<workspace>/.pi/skills` | `/` | Non-existent directories from the settings `skills` array are skipped. |
+ 
+ Command forms currently used by the providers are:
+ 
+@@ -175,6 +181,7 @@ Command forms currently used by the providers are:
+ - Codex skills: `$skill-name`
+ - Cursor skills: `/skill-name`
+ - OpenCode skills: `/skill-name`
++- pi skills: `/skill-name`
+ 
+ 6. Implement sessions.
+ 
+@@ -212,6 +219,7 @@ Current session sync roots are:
+ | Codex | `~/.codex/sessions/**/*.jsonl` | Uses `~/.codex/session_index.jsonl` for title lookup and the last `task_complete` message for a fallback title. |
+ | Cursor | `~/.cursor/projects/**/*.jsonl` | Uses sibling `worker.log` to recover `workspacePath`, then derives the session title from the first user prompt. |
+ | OpenCode | `~/.local/share/opencode/opencode.db` | Reads active sessions/messages/parts from OpenCode's shared SQLite database and stores `jsonl_path` as `null` so deleting one app session cannot remove the shared DB. |
++| pi | `~/.pi/agent/sessions/**/*.jsonl` | Derives `workspacePath` from the transcript header's `cwd`; the title prefers an explicit `session_info` name and falls back to the first user prompt. |
+ 
+ 8. Register the provider.
+ 
+@@ -234,7 +242,7 @@ If the provider is visible in the UI, update:
+ - `src/components/chat/hooks/useChatProviderState.ts`
+ - `src/components/chat/view/subcomponents/ProviderSelectionEmptyState.tsx`
+ - `src/components/provider-auth/view/ProviderLoginModal.tsx`
+-- `src/components/mcp/constants.ts`
++- `src/shared/constants.ts`
+ 
+ ## Minimal Wrapper Template
+ 
+@@ -335,7 +343,7 @@ Requirements:
+     - server/modules/providers/provider.registry.ts
+     - server/modules/providers/provider.routes.ts
+    - server/shared/types.ts LLMProvider
+-   - src/types/app.ts LLMProvider
++   - src/shared/types.ts LLMProvider
+ 3) Mirror the nearest existing provider implementation for file naming, style,
+    and error handling.
+ 4) Implement skills support with SkillsProvider and the current skill roots.
+@@ -343,7 +351,7 @@ Requirements:
+ 6) Ensure sessions use unique ids, safe path handling, and correct pagination.
+ 7) Keep `sessions` and `sessionSynchronizer` separate.
+ 8) Run:
+-   - npx eslint <touched files>
++   - npx oxlint <touched files>
+    - npx tsc --noEmit -p server/tsconfig.json
+ ```
+ 
+@@ -352,7 +360,7 @@ Requirements:
+ After adding or changing a provider, run the relevant checks:
+ 
+ ```bash
+-npx eslint server/modules/providers/**/*.ts server/shared/types.ts server/shared/interfaces.ts
++npx oxlint server/modules/providers server/shared/types.ts server/shared/interfaces.ts
+ npx tsc --noEmit -p server/tsconfig.json
+ ```
+ 
+@@ -361,6 +369,11 @@ Useful tests in this repo:
+ - `server/modules/providers/tests/mcp.test.ts`
+ - `server/modules/providers/tests/skills.test.ts`
+ - `server/modules/providers/tests/opencode-sessions.test.ts`
++- `server/modules/providers/tests/pi-registry.test.ts`
++- `server/modules/providers/tests/pi-facets.test.ts`
++- `server/modules/providers/tests/pi-session-synchronizer.test.ts`
++- `server/modules/providers/list/pi/pi-runtime.provider.test.js`
++- `server/modules/providers/list/pi/pi-sessions.provider.test.ts`
+ 
+ If you touch sessions or session synchronization, add or update focused tests
+ alongside the implementation.
+@@ -370,7 +383,7 @@ alongside the implementation.
+ - Adding provider files but forgetting `provider.registry.ts` or
+   `provider.routes.ts`.
+ - Adding a live runtime without exposing it from the provider wrapper.
+-- Updating backend provider ids but not `src/types/app.ts` or the frontend
++- Updating backend provider ids but not `src/shared/types.ts` or the frontend
+   provider constants.
+ - Omitting `runtime`, `skills`, or `sessionSynchronizer` from the wrapper.
+ - Returning duplicate normalized message ids for split content.
+diff --git a/server/modules/providers/tests/mcp.test.ts b/server/modules/providers/tests/mcp.test.ts
+index 439966ac..5f513982 100644
+--- a/server/modules/providers/tests/mcp.test.ts
++++ b/server/modules/providers/tests/mcp.test.ts
+@@ -313,8 +313,10 @@ test('providerMcpService global adder writes to all providers and rejects unsupp
+       workspacePath,
+     });
+ 
+-    assert.equal(globalResult.length, 4);
+-    assert.ok(globalResult.every((entry) => entry.created === true));
++    // `pi` is registered but does not support MCP yet, so only the four MCP
++    // providers report a successful write while `pi` reports created === false.
++    assert.equal(globalResult.length, 5);
++    assert.ok(globalResult.every((entry) => entry.created === (entry.provider !== 'pi')));
+ 
+     const claudeProject = await readJson(path.join(workspacePath, '.mcp.json'));
+     assert.ok((claudeProject.mcpServers as Record<string, unknown>)['global-http']);
+diff --git a/server/modules/providers/tests/pi-e2e.provider.test.js b/server/modules/providers/tests/pi-e2e.provider.test.js
+new file mode 100644
+index 00000000..ac063d2c
+--- /dev/null
++++ b/server/modules/providers/tests/pi-e2e.provider.test.js
+@@ -0,0 +1,472 @@
++import assert from 'node:assert/strict';
++import { randomUUID } from 'node:crypto';
++import { mkdir, mkdtemp, readdir, rmdir, rm } from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import test, { after } from 'node:test';
++
++import {
++  closeConnection,
++  initializeDatabase,
++  sessionsDb,
++} from '@/modules/database/index.js';
++import {
++  providerModelsService,
++  providerRuntimeService,
++  sessionsService,
++} from '@/modules/providers/index.js';
++import { chatRunRegistry, connectedClients } from '@/modules/websocket/index.js';
++import { getPiSessionDir } from '@/shared/utils.js';
++
++/**
++ * Opt-in end-to-end coverage: a real `pi` CLI on PATH talking to a real model
++ * through the exact production stack (provider runtime service → gateway run
++ * registry → gateway writer → isolated app database).
++ *
++ * Skipped unless the caller opts in, because every turn costs real tokens:
++ *
++ *   PI_E2E=1 PI_E2E_MODEL=glm-5.3 npm test -- pi-e2e
++ *
++ * The model id and the credentials both come from the environment (plus the
++ * user's own `~/.pi/agent/models.json`); nothing is hardcoded here.
++ */
++const enabled = process.env.PI_E2E === '1';
++const model = process.env.PI_E2E_MODEL;
++const skipReason = !enabled
++  ? 'opt-in: set PI_E2E=1 to run against a real pi CLI'
++  : !model
++    ? 'opt-in: set PI_E2E_MODEL=<provider/model> to choose the real model'
++    : false;
++
++// Real model turns take seconds to tens of seconds; a hung child must not
++// wedge the suite forever either.
++const TEST_TIMEOUT_MS = 5 * 60 * 1000;
++
++const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
++
++// ---------------------------------------------------------------------------
++// Isolated database + production gateway stand-ins
++// ---------------------------------------------------------------------------
++
++let databaseReady = false;
++let databaseDir = null;
++
++/**
++ * Points the app database at a throwaway file so the e2e never touches the
++ * developer's real sessions (same isolation the websocket tests use).
++ */
++async function ensureIsolatedDatabase() {
++  if (databaseReady) {
++    return;
++  }
++
++  databaseDir = await mkdtemp(path.join(os.tmpdir(), 'pi-e2e-db-'));
++  process.env.DATABASE_PATH = path.join(databaseDir, 'auth.db');
++  closeConnection();
++  await initializeDatabase();
++  databaseReady = true;
++}
++
++after(() => {
++  connectedClients.clear();
++  chatRunRegistry.clearAll();
++  if (databaseReady) {
++    closeConnection();
++    databaseReady = false;
++  }
++  if (databaseDir) {
++    void rm(databaseDir, { recursive: true, force: true });
++    databaseDir = null;
++  }
++});
++
++/**
++ * Minimal stand-in for a websocket connection: collects the exact JSON frames
++ * a browser would receive, so assertions run against the client-visible
++ * protocol (app session ids, seq numbers) rather than runtime internals.
++ */
++class FakeConnection {
++  readyState = 1; // WS_OPEN_STATE
++
++  frames = [];
++
++  send(data) {
++    this.frames.push(JSON.parse(data));
++  }
++}
++
++/**
++ * Drives one turn exactly the way `dispatchRun` (chat-websocket.service.ts)
++ * does: reserve the run in the registry, record the model selection, dispatch
++ * through the production runtime service, and apply the same safety-net
++ * complete. Returns what the client would have seen.
++ */
++async function runProductionTurn({ appSessionId, prompt, cwd, model: turnModel }) {
++  const session = sessionsDb.getSessionById(appSessionId);
++  assert.ok(session, 'the app session row must exist before a turn runs');
++
++  const connection = new FakeConnection();
++  const run = chatRunRegistry.startRun({
++    appSessionId,
++    provider: session.provider,
++    providerSessionId: session.provider_session_id,
++    connection,
++    userId: null,
++  });
++  assert.ok(run, 'the session must not already have a run in progress');
++
++  // dispatchRun records the picked model on the row before dispatching, which
++  // is what makes the resume turn resolve its model from the database.
++  if (turnModel) {
++    providerModelsService.setSessionModel(session.provider, appSessionId, turnModel);
++  }
++
++  let failure = null;
++  try {
++    await providerRuntimeService.run(
++      session.provider,
++      prompt,
++      {
++        sessionId: appSessionId,
++        cwd,
++        projectPath: cwd,
++        model: turnModel,
++      },
++      run.writer,
++    );
++  } catch (error) {
++    // dispatchRun swallows runtime rejections the same way and relies on the
++    // terminal complete (its own or the abort handler's) to unstick the UI.
++    failure = error instanceof Error ? error.message : String(error);
++  } finally {
++    chatRunRegistry.completeRunIfCurrent(run, { exitCode: 1 });
++  }
++
++  const recorded = chatRunRegistry.getRun(appSessionId);
++  return {
++    connection,
++    failure,
++    events: recorded ? [...recorded.events] : [],
++    stillProcessing: chatRunRegistry.isProcessing(appSessionId),
++  };
++}
++
++// ---------------------------------------------------------------------------
++// pi session file helpers
++// ---------------------------------------------------------------------------
++
++/**
++ * Locates the transcript pi wrote for one provider session id.
++ *
++ * pi stores every session of a working directory flat inside
++ * `~/.pi/agent/sessions/<encoded cwd>/`, so the encoded directory is asserted
++ * indirectly: it must sit directly under the sessions root and carry a
++ * mangled form of the temp cwd (the test's mkdtemp leaf name survives any
++ * dash encoding pi applies).
++ */
++async function findPiTranscript(providerSessionId, cwdLeafName) {
++  const root = getPiSessionDir();
++  let rootEntries = [];
++  try {
++    rootEntries = await readdir(root, { withFileTypes: true });
++  } catch {
++    return null;
++  }
++
++  for (const entry of rootEntries) {
++    if (!entry.isDirectory() || !entry.name.includes(cwdLeafName)) {
++      continue;
++    }
++
++    const encodedDir = path.join(root, entry.name);
++    const files = await readdir(encodedDir);
++    const transcript = files.find(
++      (name) => name.endsWith('.jsonl') && name.includes(providerSessionId),
++    );
++    if (transcript) {
++      return { transcriptPath: path.join(encodedDir, transcript), encodedDir };
++    }
++  }
++
++  return null;
++}
++
++/**
++ * Removes the transcript and its (now likely empty) encoded cwd directory so
++ * e2e runs do not accumulate test sessions in the developer's real pi data
++ * directory. Non-recursive on purpose: a directory that still holds anything
++ * else is left alone.
++ */
++async function cleanupPiTranscript(encodedDir, transcriptPath) {
++  await rm(transcriptPath, { force: true });
++  try {
++    await rmdir(encodedDir);
++  } catch {
++    // Still has content (or is gone) — leave it be.
++  }
++}
++
++/**
++ * Best-effort teardown for one scenario: resolves the session's provider id
++ * through the same row the gateway wrote and deletes the transcript pi left
++ * behind (an aborted run still writes its header).
++ */
++async function cleanupSessionArtifacts(appSessionId, cwdLeafName) {
++  const providerSessionId = sessionsDb.getSessionById(appSessionId)?.provider_session_id;
++  if (!providerSessionId) {
++    return;
++  }
++
++  const transcript = await findPiTranscript(providerSessionId, cwdLeafName);
++  if (transcript) {
++    await cleanupPiTranscript(transcript.encodedDir, transcript.transcriptPath);
++  }
++}
++
++// ---------------------------------------------------------------------------
++// The e2e scenarios
++// ---------------------------------------------------------------------------
++
++test(
++  'pi e2e: run → stream → complete → session file → resume → history',
++  { skip: skipReason, timeout: TEST_TIMEOUT_MS },
++  async () => {
++    await ensureIsolatedDatabase();
++    const workDir = await mkdtemp(path.join(os.tmpdir(), 'pi-e2e-run-'));
++    const cwdLeafName = path.basename(workDir);
++    const appSessionId = `pi-e2e-${randomUUID()}`;
++    sessionsDb.createAppSession(appSessionId, 'pi', workDir);
++
++    let transcript = null;
++    try {
++      // --- turn 1: fresh session, streamed reply, terminal complete -------
++      const first = await runProductionTurn({
++        appSessionId,
++        prompt: 'Reply with exactly: e2e-hello',
++        cwd: workDir,
++        model,
++      });
++
++      // The gateway swallows `session_created` and maps the provider-native id
++      // onto the app row instead; the client-visible frames carry the app id.
++      const mappedProviderId = sessionsDb.getSessionById(appSessionId).provider_session_id;
++      assert.ok(mappedProviderId, 'the gateway must persist the provider session mapping');
++      assert.notEqual(mappedProviderId, appSessionId);
++
++      const streamedText = first.connection.frames
++        .filter((frame) => frame.kind === 'stream_delta')
++        .map((frame) => frame.content)
++        .join('');
++      assert.match(streamedText, /e2e-hello/);
++      assert.ok(
++        first.connection.frames.every((frame) => frame.sessionId === appSessionId),
++        'every client frame must be remapped to the app session id',
++      );
++
++      const completes = first.connection.frames.filter((frame) => frame.kind === 'complete');
++      assert.equal(completes.length, 1, 'exactly one terminal complete per run');
++      assert.equal(completes[0].aborted, false);
++      assert.equal(completes[0].success, true);
++      assert.equal(completes[0].provider, 'pi');
++      assert.equal(first.failure, null);
++      assert.equal(first.stillProcessing, false);
++
++      const tokenBudget = first.connection.frames.find(
++        (frame) => frame.kind === 'status' && frame.text === 'token_budget',
++      );
++      assert.ok(tokenBudget, 'the run must report a token budget from pi usage');
++      assert.ok(tokenBudget.tokenBudget.used > 0);
++
++      // --- session transcript: one jsonl under the cwd-encoded directory ---
++      transcript = await findPiTranscript(mappedProviderId, cwdLeafName);
++      assert.ok(transcript, 'pi must persist the session under ~/.pi/agent/sessions');
++      assert.equal(
++        path.dirname(transcript.encodedDir),
++        getPiSessionDir(),
++        'pi keeps all sessions of one cwd flat in a single directory',
++      );
++      const siblings = await readdir(transcript.encodedDir);
++      assert.equal(
++        siblings.filter((name) => name.endsWith('.jsonl')).length,
++        1,
++        'a fresh pi session writes exactly one transcript for its cwd',
++      );
++
++      // --- turn 2: resume through the same app session id ------------------
++      const second = await runProductionTurn({
++        appSessionId,
++        prompt: 'What exact phrase did I ask you to reply with in this session? Quote it.',
++        cwd: workDir,
++        model,
++      });
++
++      const resumedText = second.connection.frames
++        .filter((frame) => frame.kind === 'stream_delta')
++        .map((frame) => frame.content)
++        .join('');
++      assert.match(resumedText, /e2e-hello/);
++      assert.equal(second.connection.frames.filter((frame) => frame.kind === 'complete').length, 1);
++      assert.equal(second.failure, null);
++      // Resume reuses the provider transcript instead of starting a new one.
++      assert.equal(
++        sessionsDb.getSessionById(appSessionId).provider_session_id,
++        mappedProviderId,
++        'resume keeps the provider-native session id',
++      );
++      const resumedSiblings = await readdir(transcript.encodedDir);
++      assert.equal(
++        resumedSiblings.filter((name) => name.endsWith('.jsonl')).length,
++        1,
++        'resumed turns append to the same session file',
++      );
++
++      // --- history: the production REST read path over the JSONL ----------
++      const history = await sessionsService.fetchHistory(appSessionId, {});
++      const historyText = history.messages
++        .filter((message) => message.kind === 'text')
++        .map((message) => message.content)
++        .join('\n');
++      assert.match(historyText, /e2e-hello/);
++      assert.ok(
++        history.messages.some((message) => message.kind === 'text' && message.role === 'user'),
++        'history must contain the user prompt',
++      );
++      assert.ok(history.tokenUsage && history.tokenUsage.used > 0);
++    } finally {
++      await cleanupSessionArtifacts(appSessionId, cwdLeafName);
++      await rm(workDir, { recursive: true, force: true });
++      chatRunRegistry.clearAll();
++    }
++  },
++);
++
++test(
++  'pi e2e: a tool turn pairs every tool_use with its tool_result',
++  { skip: skipReason, timeout: TEST_TIMEOUT_MS },
++  async () => {
++    await ensureIsolatedDatabase();
++    const workDir = await mkdtemp(path.join(os.tmpdir(), 'pi-e2e-tool-'));
++    const appSessionId = `pi-e2e-${randomUUID()}`;
++    sessionsDb.createAppSession(appSessionId, 'pi', workDir);
++
++    try {
++      await mkdir(path.join(workDir, 'pi-e2e-marker-dir'), { recursive: true });
++
++      const turn = await runProductionTurn({
++        appSessionId,
++        prompt:
++          'Use the bash tool to run exactly this one command, then answer with the command output: ls -a',
++        cwd: workDir,
++        model,
++      });
++
++      const toolUses = turn.connection.frames.filter((frame) => frame.kind === 'tool_use');
++      const toolResults = turn.connection.frames.filter((frame) => frame.kind === 'tool_result');
++      assert.ok(toolUses.length > 0, 'the run must report tool activity from pi');
++      assert.ok(toolResults.length > 0, 'the run must report tool results from pi');
++
++      // Every tool call pi starts must be closed by a result keyed by the same id.
++      for (const toolUse of toolUses) {
++        const paired = toolResults.filter((frame) => frame.toolId === toolUse.toolId);
++        assert.equal(paired.length, 1, `tool_use ${toolUse.toolId} must pair with one tool_result`);
++        assert.equal(paired[0].toolName, toolUse.toolName);
++      }
++
++      const bashResult = toolUses.some((frame) => frame.toolName === 'bash')
++        ? toolResults.find((frame) => frame.toolName === 'bash')
++        : toolResults[0];
++      assert.ok(bashResult, 'the bash tool result must reach the client');
++      assert.equal(bashResult.toolResult.isError, false);
++      assert.match(bashResult.toolResult.content, /pi-e2e-marker-dir/);
++
++      // Calibration observation (pi 0.85.1): pi finalizes one assistant
++      // message per tool round, so a tool turn streams more than one
++      // stream_end. Logged for the e2e calibration notes, not asserted.
++      const streamEnds = turn.connection.frames.filter((frame) => frame.kind === 'stream_end');
++      console.log(`[pi-e2e] tool turn stream_end count: ${streamEnds.length}`);
++
++      assert.equal(turn.connection.frames.filter((frame) => frame.kind === 'complete').length, 1);
++      assert.equal(turn.failure, null);
++
++      // The persisted history carries the same pairing back after the run.
++      const history = await sessionsService.fetchHistory(appSessionId, {});
++      const historyToolUses = history.messages.filter((message) => message.kind === 'tool_use');
++      const historyToolResults = history.messages.filter((message) => message.kind === 'tool_result');
++      assert.ok(historyToolUses.length > 0, 'history must contain the tool call');
++      assert.ok(historyToolResults.length > 0, 'history must contain the tool result');
++      for (const toolUse of historyToolUses) {
++        assert.ok(
++          historyToolResults.some((frame) => frame.toolId === toolUse.toolId),
++          'history tool_result must be keyed by the same tool id',
++        );
++      }
++    } finally {
++      await cleanupSessionArtifacts(appSessionId, path.basename(workDir));
++      await rm(workDir, { recursive: true, force: true });
++      chatRunRegistry.clearAll();
++    }
++  },
++);
++
++test(
++  'pi e2e: aborting a long run SIGTERMs pi and the client sees one aborted complete',
++  { skip: skipReason, timeout: TEST_TIMEOUT_MS },
++  async () => {
++    await ensureIsolatedDatabase();
++    const workDir = await mkdtemp(path.join(os.tmpdir(), 'pi-e2e-abort-'));
++    const appSessionId = `pi-e2e-${randomUUID()}`;
++    sessionsDb.createAppSession(appSessionId, 'pi', workDir);
++
++    try {
++      const connection = new FakeConnection();
++      const run = chatRunRegistry.startRun({
++        appSessionId,
++        provider: 'pi',
++        providerSessionId: sessionsDb.getSessionById(appSessionId).provider_session_id,
++        connection,
++        userId: null,
++      });
++      assert.ok(run);
++
++      let failure = null;
++      const runPromise = providerRuntimeService.run(
++        'pi',
++        'Count slowly from 1 to 100, one number per line.',
++        { sessionId: appSessionId, cwd: workDir, projectPath: workDir, model },
++        run.writer,
++      ).catch((error) => {
++        failure = error instanceof Error ? error.message : String(error);
++      });
++
++      // Poll like a user hammering Stop: the process row appears as soon as pi
++      // is spawned, then give the turn a second so there is something to cut.
++      let aborted = false;
++      for (let attempt = 0; attempt < 100 && !aborted; attempt += 1) {
++        aborted = await providerRuntimeService.abort('pi', appSessionId);
++        if (!aborted) {
++          await sleep(100);
++        }
++      }
++      assert.equal(aborted, true, 'the running pi process must be abortable by app session id');
++      await sleep(1000);
++      assert.equal(await providerRuntimeService.abort('pi', appSessionId), false);
++
++      // handleChatAbort's exact sequence: the gateway emits the terminal
++      // complete on the run's behalf because aborted runtimes stay silent.
++      chatRunRegistry.completeRun(appSessionId, { exitCode: 0, aborted: true });
++
++      await runPromise;
++      assert.match(failure || '', /terminated|exited with code/);
++
++      const completes = connection.frames.filter((frame) => frame.kind === 'complete');
++      assert.equal(completes.length, 1, 'exactly one complete reaches the client');
++      assert.equal(completes[0].aborted, true);
++      assert.equal(completes[0].provider, 'pi');
++      assert.equal(chatRunRegistry.isProcessing(appSessionId), false, 'the session must not stay stuck');
++    } finally {
++      await cleanupSessionArtifacts(appSessionId, path.basename(workDir));
++      await rm(workDir, { recursive: true, force: true });
++      chatRunRegistry.clearAll();
++    }
++  },
++);
+diff --git a/server/modules/providers/tests/pi-facets.test.ts b/server/modules/providers/tests/pi-facets.test.ts
+new file mode 100644
+index 00000000..7d1aa54d
+--- /dev/null
++++ b/server/modules/providers/tests/pi-facets.test.ts
+@@ -0,0 +1,436 @@
++import assert from 'node:assert/strict';
++import { mkdir, mkdtemp, rm, symlink, writeFile } from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import test from 'node:test';
++
++import { PI_ENV_CREDENTIAL_KEYS, PiProviderAuth } from '@/modules/providers/list/pi/pi-auth.provider.js';
++import { PiMcpProvider } from '@/modules/providers/list/pi/pi-mcp.provider.js';
++import {
++  PI_PREDEFINED_MODELS,
++  PiProviderModels,
++} from '@/modules/providers/list/pi/pi-models.provider.js';
++import { PiSkillsProvider } from '@/modules/providers/list/pi/pi-skills.provider.js';
++import { createProviderTokenUsageService } from '@/modules/providers/services/provider-token-usage.service.js';
++import { AppError } from '@/shared/utils.js';
++
++// ---------------------------------------------------------------------------
++// Shared isolation helpers
++// ---------------------------------------------------------------------------
++
++const patchHomeDir = (nextHomeDir: string) => {
++  const original = os.homedir;
++  (os as any).homedir = () => nextHomeDir;
++  return () => {
++    (os as any).homedir = original;
++  };
++};
++
++// Environment scrubbing uses the auth adapter's own manifest of the env
++// variables pi 0.85.1 reads as credentials (pi's env-api-keys mapping), so
++// "no credentials" tests stay honest even when the developer machine running
++// the suite has a real key exported.
++
++const withEnvironmentCredentials = async (
++  values: Record<string, string>,
++  run: () => Promise<void>,
++): Promise<void> => {
++  const savedEntries = PI_ENV_CREDENTIAL_KEYS.map(
++    (key) => [key, process.env[key]] as const,
++  );
++  try {
++    for (const key of PI_ENV_CREDENTIAL_KEYS) {
++      delete process.env[key];
++    }
++    for (const [key, value] of Object.entries(values)) {
++      process.env[key] = value;
++    }
++    await run();
++  } finally {
++    for (const [key, value] of savedEntries) {
++      if (value === undefined) {
++        delete process.env[key];
++      } else {
++        process.env[key] = value;
++      }
++    }
++  }
++};
++
++const withPath = async (nextPath: string, run: () => Promise<void>): Promise<void> => {
++  const originalPath = process.env.PATH;
++  process.env.PATH = nextPath;
++  try {
++    await run();
++  } finally {
++    process.env.PATH = originalPath;
++  }
++};
++
++/**
++ * Writes a `pi` stub that exits 0 for `--version` and answers
++ * `auth check … --json` with the given document (nothing when null, which
++ * leaves the probe unable to resolve credentials).
++ */
++const writeFakePiCli = async (
++  binDir: string,
++  authCheckJson: Record<string, unknown> | null = null,
++): Promise<string> => {
++  await mkdir(binDir, { recursive: true });
++  // A shebang script resolves through the kernel on macOS/Linux; the CI and
++  // developer suites for this repo never run the server tests on Windows.
++  const authLine = authCheckJson
++    ? `printf '%s' '${JSON.stringify(authCheckJson).replace(/'/g, "'\\''")}'`
++    : ':';
++  await writeFile(
++    path.join(binDir, 'pi'),
++    `#!/bin/sh\nif [ "$1" = "auth" ]; then ${authLine}; fi\nexit 0\n`,
++    { mode: 0o755 },
++  );
++  return binDir;
++};
++
++const withIsolatedPiHome = async (run: (homeDir: string) => Promise<void>): Promise<void> => {
++  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'pi-facets-'));
++  const restoreHomeDir = patchHomeDir(tempRoot);
++  try {
++    await run(tempRoot);
++  } finally {
++    restoreHomeDir();
++    await rm(tempRoot, { recursive: true, force: true });
++  }
++};
++
++const writeSkill = async (skillDir: string, name: string, description: string): Promise<void> => {
++  await mkdir(skillDir, { recursive: true });
++  await writeFile(
++    path.join(skillDir, 'SKILL.md'),
++    `---\nname: ${name}\ndescription: ${description}\n---\n\nBody for ${name}.\n`,
++    'utf8',
++  );
++};
++
++// ---------------------------------------------------------------------------
++// auth
++// ---------------------------------------------------------------------------
++
++test('the env credential manifest covers the probed providers and names its exclusions', () => {
++  // The credential probe asks pi about exactly these providers; each must have
++  // its env key in the manifest, or a usable key could sit in the environment
++  // while the scrubbed tests report "no credentials".
++  for (const key of ['ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'ZAI_CODING_CN_API_KEY']) {
++    assert.ok(PI_ENV_CREDENTIAL_KEYS.includes(key), `${key} is missing from the manifest`);
++  }
++
++  // Deliberate exclusions (see the manifest's comment): special gateways and
++  // the AWS credential chain are not plain per-provider API keys.
++  assert.equal(PI_ENV_CREDENTIAL_KEYS.includes('ANT_LING_API_KEY'), false);
++  assert.equal(PI_ENV_CREDENTIAL_KEYS.includes('OPENCODE_API_KEY'), false);
++  assert.equal(PI_ENV_CREDENTIAL_KEYS.some((key) => key.startsWith('AWS_')), false);
++});
++
++test('auth reports an installed pi with no credentials as merely unauthenticated', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const binDir = await writeFakePiCli(path.join(homeDir, 'bin'));
++    await withPath(binDir, async () => {
++      await withEnvironmentCredentials({}, async () => {
++        const status = await new PiProviderAuth().getStatus();
++
++        assert.equal(status.provider, 'pi');
++        assert.equal(status.installed, true);
++        assert.equal(status.authenticated, false);
++        assert.equal(status.method, null);
++        // pi has no account identity, so there is no email to report.
++        assert.equal(status.email, null);
++        // An unauthenticated pi is a neutral state, not an error the UI should
++        // render as a failure.
++        assert.equal(status.error, undefined);
++      });
++    });
++  });
++});
++
++test('auth reports pi as not installed when the CLI is missing from PATH', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const emptyDir = path.join(homeDir, 'empty-bin');
++    await mkdir(emptyDir, { recursive: true });
++    await withPath(emptyDir, async () => {
++      await withEnvironmentCredentials({}, async () => {
++        const status = await new PiProviderAuth().getStatus();
++
++        assert.equal(status.installed, false);
++        assert.equal(status.authenticated, false);
++      });
++    });
++  });
++});
++
++test('auth accepts provider API keys exported into the environment', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    // pi itself resolves env API keys, so its auth check answers ready with
++    // authType api_key — the adapter passes that contract through.
++    const binDir = await writeFakePiCli(path.join(homeDir, 'bin'), {
++      status: 'ready',
++      provider: 'anthropic',
++      authType: 'api_key',
++    });
++    await withPath(binDir, async () => {
++      await withEnvironmentCredentials({ ANTHROPIC_API_KEY: 'test-key-placeholder' }, async () => {
++        const status = await new PiProviderAuth().getStatus();
++
++        assert.equal(status.authenticated, true);
++        assert.equal(status.method, 'api_key');
++        assert.equal(status.email, null);
++      });
++    });
++  });
++});
++
++test('auth does not treat an empty auth store as usable credentials', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    // pi 0.85.1 resolves typed entries through its credential store: an
++    // empty `auth.json` establishes nothing, so the adapter must not report
++    // oauth credentials for a file that merely exists.
++    const binDir = await writeFakePiCli(path.join(homeDir, 'bin'), {
++      status: 'not_ready',
++      provider: 'anthropic',
++      reason: 'credentials_not_configured',
++    });
++    const agentDir = path.join(homeDir, '.pi', 'agent');
++    await mkdir(agentDir, { recursive: true });
++    await writeFile(path.join(agentDir, 'auth.json'), '{}\n', 'utf8');
++    await withPath(binDir, async () => {
++      await withEnvironmentCredentials({}, async () => {
++        const status = await new PiProviderAuth().getStatus();
++
++        assert.equal(status.authenticated, false);
++        assert.equal(status.method, null);
++      });
++    });
++  });
++});
++
++// ---------------------------------------------------------------------------
++// models
++// ---------------------------------------------------------------------------
++
++test('the pi catalog keeps the frontend default and declares effort for every model', () => {
++  assert.equal(PI_PREDEFINED_MODELS.DEFAULT, 'anthropic/claude-sonnet-4');
++
++  const values = PI_PREDEFINED_MODELS.OPTIONS.map((option) => option.value);
++  assert.ok(values.length > 0);
++  assert.ok(values.includes(PI_PREDEFINED_MODELS.DEFAULT));
++
++  for (const option of PI_PREDEFINED_MODELS.OPTIONS) {
++    assert.ok(option.label.trim().length > 0, `${option.value} needs a label`);
++    assert.ok(
++      Array.isArray(option.effort?.values),
++      `${option.value} must declare an effort list (empty until pi exposes one)`,
++    );
++  }
++
++  for (const providerPrefix of ['anthropic/', 'zai-coding-cn/', 'openai/']) {
++    assert.ok(
++      values.some((value) => value.startsWith(providerPrefix)),
++      `catalog is missing a ${providerPrefix}* model`,
++    );
++  }
++});
++
++test('the pi models facet serves the curated catalog and its default', async () => {
++  const models = new PiProviderModels();
++
++  assert.deepEqual(await models.getSupportedModels(), PI_PREDEFINED_MODELS);
++  assert.deepEqual(await models.getCurrentActiveModel(), {
++    model: PI_PREDEFINED_MODELS.DEFAULT,
++  });
++  // Phase 1 has no runtime model state to read back, so a session id resolves
++  // to the same curated default.
++  assert.deepEqual(await models.getCurrentActiveModel('session-1'), {
++    model: PI_PREDEFINED_MODELS.DEFAULT,
++  });
++});
++
++// ---------------------------------------------------------------------------
++// skills
++// ---------------------------------------------------------------------------
++
++test('listSkills reads pi user skills, settings.json sources and workspace skills', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const configuredDir = path.join(homeDir, 'configured-skills');
++    await writeSkill(path.join(configuredDir, 'deploy-notes'), 'deploy-notes', 'Deploy checklist.');
++    await writeSkill(
++      path.join(homeDir, '.pi', 'agent', 'skills', 'release-check'),
++      'release-check',
++      'Release checklist.',
++    );
++
++    const workspacePath = path.join(homeDir, 'workspace');
++    await writeSkill(
++      path.join(workspacePath, '.pi', 'skills', 'repo-lint'),
++      'repo-lint',
++      'Repository lint.',
++    );
++
++    const agentDir = path.join(homeDir, '.pi', 'agent');
++    await mkdir(agentDir, { recursive: true });
++    await writeFile(
++      path.join(agentDir, 'settings.json'),
++      `${JSON.stringify({ skills: [configuredDir] })}\n`,
++      'utf8',
++    );
++
++    const skills = await new PiSkillsProvider().listSkills({ workspacePath });
++    const byName = new Map(skills.map((skill) => [skill.name, skill]));
++
++    assert.deepEqual([...byName.keys()].sort(), ['deploy-notes', 'release-check', 'repo-lint']);
++    assert.equal(byName.get('deploy-notes')?.command, '/deploy-notes');
++    assert.equal(byName.get('deploy-notes')?.scope, 'user');
++    assert.equal(byName.get('deploy-notes')?.provider, 'pi');
++    assert.equal(byName.get('deploy-notes')?.description, 'Deploy checklist.');
++    assert.equal(byName.get('release-check')?.scope, 'user');
++    assert.equal(byName.get('repo-lint')?.scope, 'project');
++    assert.equal(byName.get('repo-lint')?.command, '/repo-lint');
++  });
++});
++
++test('listSkills skips settings.json skill directories that no longer exist', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const configuredDir = path.join(homeDir, 'configured-skills');
++    await writeSkill(path.join(configuredDir, 'deploy-notes'), 'deploy-notes', 'Deploy checklist.');
++
++    const agentDir = path.join(homeDir, '.pi', 'agent');
++    await mkdir(agentDir, { recursive: true });
++    await writeFile(
++      path.join(agentDir, 'settings.json'),
++      `${JSON.stringify({ skills: [configuredDir, path.join(homeDir, 'gone-skills')] })}\n`,
++      'utf8',
++    );
++
++    const skills = await new PiSkillsProvider().listSkills({
++      workspacePath: path.join(homeDir, 'workspace'),
++    });
++
++    assert.deepEqual(skills.map((skill) => skill.name), ['deploy-notes']);
++  });
++});
++
++// ---------------------------------------------------------------------------
++// mcp
++// ---------------------------------------------------------------------------
++
++test('pi reports no MCP servers in any scope', async () => {
++  const servers = await new PiMcpProvider().listServers({
++    workspacePath: path.join(os.tmpdir(), 'pi-facets-mcp'),
++  });
++
++  assert.deepEqual(servers, { user: [], local: [], project: [] });
++});
++
++test('pi rejects MCP server writes as unsupported', async () => {
++  const mcp = new PiMcpProvider();
++
++  await assert.rejects(
++    () => mcp.upsertServer({
++      name: 'docs',
++      transport: 'stdio',
++      command: 'npx',
++      args: ['-y', 'docs-server'],
++      scope: 'project',
++      workspacePath: path.join(os.tmpdir(), 'pi-facets-mcp'),
++    }),
++    (error: unknown) => (
++      error instanceof AppError
++      && error.code === 'NOT_SUPPORTED'
++      && /Pi does not support MCP/.test(error.message)
++    ),
++  );
++});
++
++// ---------------------------------------------------------------------------
++// token usage
++// ---------------------------------------------------------------------------
++
++test('pi token usage returns an explicit unsupported result', async () => {
++  const service = createProviderTokenUsageService({
++    getSessionById: () => ({
++      session_id: 'app-session',
++      provider: 'pi',
++      provider_session_id: 'provider-session',
++      project_path: null,
++      jsonl_path: null,
++      custom_name: null,
++      model: null,
++      effort: null,
++      forked_from_session_id: null,
++      isArchived: 0,
++      created_at: '2026-01-01T00:00:00.000Z',
++      updated_at: '2026-01-01T00:00:00.000Z',
++    }),
++  });
++
++  const result = await service.getSessionTokenUsage('app-session');
++
++  assert.equal(result.unsupported, true);
++  assert.equal(result.used, 0);
++  assert.equal(result.total, 0);
++  assert.deepEqual(result.breakdown, { input: 0, output: 0 });
++});
++
++test('listSkills reads the Agent Skills compatibility folder pi also scans', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const workspacePath = path.join(homeDir, 'workspace');
++    await writeSkill(
++      path.join(workspacePath, '.agents', 'skills', 'openspec-apply'),
++      'openspec-apply',
++      'Apply an OpenSpec change.',
++    );
++
++    const skills = await new PiSkillsProvider().listSkills({ workspacePath });
++    const names = skills.map((skill) => skill.name);
++
++    assert.deepEqual(names, ['openspec-apply']);
++    assert.equal(skills[0]?.scope, 'project');
++  });
++});
++
++test('listSkills lists a skill once even when two roots reach the same file', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const workspacePath = path.join(homeDir, 'workspace');
++    const sharedPath = path.join(workspacePath, '.pi', 'skills', 'shared-skill');
++    await writeSkill(sharedPath, 'shared-skill', 'Shared skill.');
++    // The compatibility folder symlinked/copied to the same skill is the case
++    // the runtime dedupes on: one SKILL.md is one skill.
++    await mkdir(path.join(workspacePath, '.agents'), { recursive: true });
++    try {
++      await symlink(
++        path.join(workspacePath, '.pi', 'skills'),
++        path.join(workspacePath, '.agents', 'skills'),
++        'junction',
++      );
++    } catch {
++      // A platform without symlink support cannot reach the same file twice.
++      return;
++    }
++
++    const skills = await new PiSkillsProvider().listSkills({ workspacePath });
++    assert.deepEqual(skills.map((skill) => skill.name), ['shared-skill']);
++  });
++});
++
++test('listSkills without a requested workspace lists only user skills', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    await writeSkill(
++      path.join(homeDir, '.pi', 'agent', 'skills', 'release-check'),
++      'release-check',
++      'Release checklist.',
++    );
++    // The server's own cwd has skills too; a global listing must not adopt them.
++    const cwdSkills = path.join(process.cwd(), '.agents', 'skills');
++    const before = await new PiSkillsProvider().listSkills({});
++
++    // Every returned skill is a user skill, whatever the checkout contains.
++    assert.deepEqual(before.map((skill) => skill.scope), ['user']);
++    assert.equal(before.some((skill) => skill.sourcePath.startsWith(cwdSkills)), false);
++  });
++});
+diff --git a/server/modules/providers/tests/pi-registry.test.ts b/server/modules/providers/tests/pi-registry.test.ts
+new file mode 100644
+index 00000000..60ebd6c3
+--- /dev/null
++++ b/server/modules/providers/tests/pi-registry.test.ts
+@@ -0,0 +1,14 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++
++import { providerRegistry } from '@/modules/providers/provider.registry.js';
++
++test('pi is a registered provider', () => {
++  const provider = providerRegistry.resolveProvider('pi');
++  assert.equal(provider.id, 'pi');
++  assert.equal(providerRegistry.listProviders().length, 5);
++});
++
++test('resolveProvider throws for unknown provider', () => {
++  assert.throws(() => providerRegistry.resolveProvider('nope'), /Unsupported provider/);
++});
+diff --git a/server/modules/providers/tests/pi-session-synchronizer.test.ts b/server/modules/providers/tests/pi-session-synchronizer.test.ts
+new file mode 100644
+index 00000000..111d3dc8
+--- /dev/null
++++ b/server/modules/providers/tests/pi-session-synchronizer.test.ts
+@@ -0,0 +1,292 @@
++import assert from 'node:assert/strict';
++import { mkdir, mkdtemp, rm, utimes, writeFile } from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import test from 'node:test';
++
++import { closeConnection, initializeDatabase, sessionsDb } from '@/modules/database/index.js';
++import { PiSessionSynchronizer } from '@/modules/providers/list/pi/pi-session-synchronizer.provider.js';
++
++const patchHomeDir = (nextHomeDir: string) => {
++  const original = os.homedir;
++  (os as any).homedir = () => nextHomeDir;
++  return () => {
++    (os as any).homedir = original;
++  };
++};
++
++async function withIsolatedDatabase(runTest: () => void | Promise<void>): Promise<void> {
++  const previousDatabasePath = process.env.DATABASE_PATH;
++  const tempDirectory = await mkdtemp(path.join(os.tmpdir(), 'pi-synchronizer-db-'));
++  const databasePath = path.join(tempDirectory, 'auth.db');
++
++  closeConnection();
++  process.env.DATABASE_PATH = databasePath;
++  await initializeDatabase();
++
++  try {
++    await runTest();
++  } finally {
++    closeConnection();
++    if (previousDatabasePath === undefined) {
++      delete process.env.DATABASE_PATH;
++    } else {
++      process.env.DATABASE_PATH = previousDatabasePath;
++    }
++    await rm(tempDirectory, { recursive: true, force: true });
++  }
++}
++
++const SESSION_ONE_ID = '01a095e3-bb8a-72a9-83a6-66b7c73b176d';
++const SESSION_TWO_ID = '02b106f4-cc9b-83ba-94b7-77c8d84c287e';
++const SESSION_THREE_ID = '03c217a5-ddac-94cb-a5c8-88d9e95d398f';
++
++const sessionHeaderLine = (sessionId: string, timestamp: string, cwd: string) =>
++  JSON.stringify({ type: 'session', version: 3, id: sessionId, timestamp, cwd });
++
++const userMessageLine = (text: string) =>
++  JSON.stringify({
++    type: 'message',
++    id: 'm-user',
++    parentId: null,
++    timestamp: '2026-09-12T13:52:06.000Z',
++    message: {
++      role: 'user',
++      content: [{ type: 'text', text }],
++      api: 'anthropic-messages',
++      provider: 'anthropic',
++      model: 'glm-5.3',
++      stopReason: 'stop',
++      usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 10 },
++    },
++  });
++
++/**
++ * Writes one pi transcript the way pi 0.85.1 lays sessions out on disk:
++ * `~/.pi/agent/sessions/<encoded-cwd>/<ISO timestamp>_<session uuid>.jsonl`.
++ */
++async function writePiSession(
++  homeDir: string,
++  options: {
++    encodedCwd: string;
++    fileName: string;
++    lines: string[];
++    mtime?: Date;
++  },
++): Promise<string> {
++  const sessionDirectory = path.join(homeDir, '.pi', 'agent', 'sessions', options.encodedCwd);
++  await mkdir(sessionDirectory, { recursive: true });
++  const filePath = path.join(sessionDirectory, options.fileName);
++  await writeFile(filePath, `${options.lines.join('\n')}\n`, 'utf8');
++  if (options.mtime) {
++    await utimes(filePath, options.mtime, options.mtime);
++  }
++  return filePath;
++}
++
++async function withIsolatedPiHome(run: (homeDir: string) => Promise<void>): Promise<void> {
++  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'pi-synchronizer-home-'));
++  const restoreHomeDir = patchHomeDir(tempRoot);
++  try {
++    await run(tempRoot);
++  } finally {
++    restoreHomeDir();
++    await rm(tempRoot, { recursive: true, force: true });
++  }
++}
++
++test('synchronize upserts pi sessions into the sidebar db', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const projectOne = path.join(homeDir, 'workspaces', 'checkout');
++    const projectTwo = path.join(homeDir, 'workspaces', 'docs');
++
++    // Long enough that the 120-char session name bound kicks in.
++    const longPrompt = `Fix the login redirect loop${' and keep the retry budget intact'.repeat(4)}`;
++    await writePiSession(homeDir, {
++      encodedCwd: '--x--',
++      fileName: `2026-09-12T13-52-05-003Z_${SESSION_ONE_ID}.jsonl`,
++      lines: [
++        sessionHeaderLine(SESSION_ONE_ID, '2026-09-12T13:52:05.003Z', projectOne),
++        userMessageLine(longPrompt),
++      ],
++    });
++    // A header-only transcript: the session still gets indexed, untitled.
++    await writePiSession(homeDir, {
++      encodedCwd: '--y--',
++      fileName: `2026-09-12T14-00-00-000Z_${SESSION_TWO_ID}.jsonl`,
++      lines: [sessionHeaderLine(SESSION_TWO_ID, '2026-09-12T14:00:00.000Z', projectTwo)],
++    });
++
++    await withIsolatedDatabase(async () => {
++      const processed = await new PiSessionSynchronizer().synchronize(new Date(0));
++      assert.equal(processed, 2);
++
++      const first = sessionsDb.getSessionByProviderSessionId(SESSION_ONE_ID);
++      assert.equal(first?.provider, 'pi');
++      assert.equal(first?.project_path, projectOne);
++      // The name comes from the first user message, truncated to the standard bound.
++      assert.equal(first?.custom_name?.length, 120);
++      assert.ok(first?.custom_name?.startsWith('Fix the login redirect loop'));
++      // pi keeps every transcript in one shared tree, so the row must never
++      // claim a deletable jsonl path (same reasoning as opencode).
++      assert.equal(first?.jsonl_path, null);
++      assert.equal(first?.created_at, '2026-09-12T13:52:05.003Z');
++
++      const second = sessionsDb.getSessionByProviderSessionId(SESSION_TWO_ID);
++      assert.equal(second?.provider, 'pi');
++      assert.equal(second?.project_path, projectTwo);
++      assert.equal(second?.custom_name, 'Untitled pi Session');
++    });
++  });
++});
++
++test('synchronizeFile only handles pi session jsonl files', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const projectPath = path.join(homeDir, 'workspaces', 'changelog');
++    const transcriptPath = await writePiSession(homeDir, {
++      encodedCwd: '--z--',
++      fileName: `2026-09-12T15-00-00-000Z_${SESSION_THREE_ID}.jsonl`,
++      lines: [
++        sessionHeaderLine(SESSION_THREE_ID, '2026-09-12T15:00:00.000Z', projectPath),
++        userMessageLine('Summarize the changelog'),
++      ],
++    });
++
++    await withIsolatedDatabase(async () => {
++      const synchronizer = new PiSessionSynchronizer();
++
++      // Foreign artifacts (opencode's sqlite store, stray jsonl elsewhere)
++      // must not be touched.
++      assert.equal(await synchronizer.synchronizeFile('/tmp/opencode.db'), null);
++      assert.equal(await synchronizer.synchronizeFile(path.join(homeDir, 'notes.jsonl')), null);
++
++      const sessionId = await synchronizer.synchronizeFile(transcriptPath);
++      assert.equal(sessionId, SESSION_THREE_ID);
++
++      const indexed = sessionsDb.getSessionByProviderSessionId(SESSION_THREE_ID);
++      assert.equal(indexed?.provider, 'pi');
++      assert.equal(indexed?.project_path, projectPath);
++      assert.equal(indexed?.custom_name, 'Summarize the changelog');
++    });
++  });
++});
++
++test('synchronize(since) skips files whose mtime is older than the cursor', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const projectPath = path.join(homeDir, 'workspaces', 'old-and-new');
++    await writePiSession(homeDir, {
++      encodedCwd: '--old--',
++      fileName: `2026-09-12T09-00-00-000Z_${SESSION_ONE_ID}.jsonl`,
++      lines: [sessionHeaderLine(SESSION_ONE_ID, '2026-09-12T09:00:00.000Z', projectPath)],
++      mtime: new Date(Date.now() - 3_600_000),
++    });
++    await writePiSession(homeDir, {
++      encodedCwd: '--new--',
++      fileName: `2026-09-12T16-00-00-000Z_${SESSION_TWO_ID}.jsonl`,
++      lines: [sessionHeaderLine(SESSION_TWO_ID, '2026-09-12T16:00:00.000Z', projectPath)],
++    });
++
++    await withIsolatedDatabase(async () => {
++      const processed = await new PiSessionSynchronizer().synchronize(
++        new Date(Date.now() - 1_800_000),
++      );
++      assert.equal(processed, 1);
++      assert.equal(sessionsDb.getSessionByProviderSessionId(SESSION_TWO_ID)?.provider, 'pi');
++      assert.equal(sessionsDb.getSessionByProviderSessionId(SESSION_ONE_ID), null);
++
++      // A full scan (no cursor) still picks the older file up.
++      assert.equal(await new PiSessionSynchronizer().synchronize(), 2);
++      assert.ok(sessionsDb.getSessionByProviderSessionId(SESSION_ONE_ID));
++    });
++  });
++});
++
++test('synchronizeFile adopts the pending app session instead of creating a duplicate', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const projectPath = path.join(homeDir, 'workspaces', 'race');
++    // The real race: the app allocates its row a few seconds before pi
++    // writes the transcript header, so the header must predate the row's
++    // CURRENT_TIMESTAMP only by a small, correlated margin.
++    const sessionStart = new Date(Date.now() - 3_000);
++    const fileNameStamp = sessionStart.toISOString().replace(/[:.]/g, '-');
++    const transcriptPath = await writePiSession(homeDir, {
++      encodedCwd: '--race--',
++      fileName: `${fileNameStamp}_${SESSION_ONE_ID}.jsonl`,
++      lines: [
++        sessionHeaderLine(SESSION_ONE_ID, sessionStart.toISOString(), projectPath),
++        userMessageLine('Why is the build red?'),
++      ],
++    });
++
++    await withIsolatedDatabase(async () => {
++      sessionsDb.createAppSession('app-session-1', 'pi', projectPath, 'Why is the build red?');
++
++      const sessionId = await new PiSessionSynchronizer().synchronizeFile(transcriptPath);
++
++      assert.equal(sessionId, 'app-session-1');
++      assert.equal(sessionsDb.getAllSessions().length, 1);
++      const adopted = sessionsDb.getSessionById('app-session-1');
++      assert.equal(adopted?.provider_session_id, SESSION_ONE_ID);
++      assert.equal(adopted?.custom_name, 'Why is the build red?');
++    });
++  });
++});
++
++test('synchronizeFile does not bind a pending app session newer than the transcript session', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const projectPath = path.join(homeDir, 'workspaces', 'cli-first');
++    // A direct CLI pi run in this project; an hour later the user opens a
++    // fresh app session that is still pending when the watcher indexes the
++    // CLI transcript. The unrelated newer row must keep its null provider id.
++    const sessionStart = new Date(Date.now() - 3_600_000);
++    const fileNameStamp = sessionStart.toISOString().replace(/[:.]/g, '-');
++    const transcriptPath = await writePiSession(homeDir, {
++      encodedCwd: '--cli-first--',
++      fileName: `${fileNameStamp}_${SESSION_ONE_ID}.jsonl`,
++      lines: [
++        sessionHeaderLine(SESSION_ONE_ID, sessionStart.toISOString(), projectPath),
++        userMessageLine('Ran from the terminal'),
++      ],
++    });
++
++    await withIsolatedDatabase(async () => {
++      sessionsDb.createAppSession('app-session-1', 'pi', projectPath, 'Unrelated pending row');
++
++      const sessionId = await new PiSessionSynchronizer().synchronizeFile(transcriptPath);
++
++      // The transcript lands under its own provider-keyed row instead of
++      // stealing the pending app row's identity.
++      assert.equal(sessionId, SESSION_ONE_ID);
++      assert.equal(sessionsDb.getSessionById('app-session-1')?.provider_session_id, null);
++      assert.equal(sessionsDb.getAllSessions().length, 2);
++    });
++  });
++});
++
++test('synchronizeFile does not bind a pending app session older than the binding window', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    const projectPath = path.join(homeDir, 'workspaces', 'stale-row');
++    // The pending row is a leftover from a failed run; the transcript's
++    // session starts far after that row was created, so no correlation.
++    const sessionStart = new Date(Date.now() + 3_600_000);
++    const fileNameStamp = sessionStart.toISOString().replace(/[:.]/g, '-');
++    const transcriptPath = await writePiSession(homeDir, {
++      encodedCwd: '--stale-row--',
++      fileName: `${fileNameStamp}_${SESSION_TWO_ID}.jsonl`,
++      lines: [
++        sessionHeaderLine(SESSION_TWO_ID, sessionStart.toISOString(), projectPath),
++        userMessageLine('A brand new session'),
++      ],
++    });
++
++    await withIsolatedDatabase(async () => {
++      sessionsDb.createAppSession('app-session-1', 'pi', projectPath, 'Stale pending row');
++
++      const sessionId = await new PiSessionSynchronizer().synchronizeFile(transcriptPath);
++
++      assert.equal(sessionId, SESSION_TWO_ID);
++      assert.equal(sessionsDb.getSessionById('app-session-1')?.provider_session_id, null);
++      assert.equal(sessionsDb.getAllSessions().length, 2);
++    });
++  });
++});
+diff --git a/server/modules/providers/tests/provider-capabilities.service.test.ts b/server/modules/providers/tests/provider-capabilities.service.test.ts
+index 6b8c3b81..6c9e6b0d 100644
+--- a/server/modules/providers/tests/provider-capabilities.service.test.ts
++++ b/server/modules/providers/tests/provider-capabilities.service.test.ts
+@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
+ import test from 'node:test';
+ 
+ import { CLAUDE_PREDEFINED_MODELS } from '@/modules/providers/list/claude/claude-models.provider.js';
++import { PI_PREDEFINED_MODELS } from '@/modules/providers/list/pi/pi-models.provider.js';
+ import { CODEX_PREDEFINED_MODELS } from '@/modules/providers/list/codex/codex-models.provider.js';
+ import { CURSOR_PREDEFINED_MODELS } from '@/modules/providers/list/cursor/cursor-models.provider.js';
+ import { OPENCODE_PREDEFINED_MODELS } from '@/modules/providers/list/opencode/opencode-models.provider.js';
+@@ -17,6 +18,7 @@ const CURATED_CATALOGS: Record<LLMProvider, ProviderModelsDefinition> = {
+   codex: CODEX_PREDEFINED_MODELS,
+   cursor: CURSOR_PREDEFINED_MODELS,
+   opencode: OPENCODE_PREDEFINED_MODELS,
++  pi: PI_PREDEFINED_MODELS,
+ };
+ 
+ test('capability effort levels cover every level a curated model declares', () => {
+@@ -45,6 +47,7 @@ test('side questions are supported by claude, codex and opencode, not by cursor'
+     codex: true,
+     cursor: false,
+     opencode: true,
++    pi: false,
+   };
+   for (const [provider, supported] of Object.entries(expected) as Array<[LLMProvider, boolean]>) {
+     const capabilities = providerCapabilitiesService.getProviderCapabilities(provider) as unknown as Record<string, unknown>;
+diff --git a/server/modules/providers/tests/provider-models.service.test.ts b/server/modules/providers/tests/provider-models.service.test.ts
+index dc16a714..d7cc41d9 100644
+--- a/server/modules/providers/tests/provider-models.service.test.ts
++++ b/server/modules/providers/tests/provider-models.service.test.ts
+@@ -11,10 +11,14 @@ import type {
+ } from '@/shared/types.js';
+ import { AppError } from '@/shared/utils.js';
+ 
+-const createModels = (value: string): ProviderModelsDefinition => ({
+-  OPTIONS: [{ value, label: value }],
+-  DEFAULT: value,
+-});
++/** A catalog whose options are the given values, defaulting to the first. */
++const createModels = (...values: string[]): ProviderModelsDefinition => {
++  const optionValues = values.length > 0 ? values : ['default'];
++  return {
++    OPTIONS: optionValues.map((value) => ({ value, label: value })),
++    DEFAULT: optionValues[0],
++  };
++};
+ 
+ const createCurrentActiveModel = (model: string): ProviderCurrentActiveModel => ({ model });
+ 
+@@ -128,6 +132,12 @@ const createTestService = (options: {
+   settings?: ReturnType<typeof createSettingsStore>;
+   activeModel?: (provider: LLMProvider, sessionId?: string) => string;
+   onCatalogRead?: (provider: LLMProvider) => void;
++  /** Models the adapter catalog offers; defaults to a single `<provider>-default`. */
++  catalogModels?: string[];
++  /** Providers the catalog withheld for failing a reachability probe. */
++  unreachableProviders?: string[];
++  /** Built-ins a custom-models-only catalog hides. */
++  hiddenBuiltIns?: string[];
+ } = {}) => {
+   const catalog = options.catalog ?? createCatalogStore();
+   const sessions = options.sessions ?? createSessionStore();
+@@ -140,7 +150,14 @@ const createTestService = (options: {
+       models: {
+         getSupportedModels: async () => {
+           options.onCatalogRead?.(provider);
+-          return createModels(`${provider}-default`);
++          const catalog = options.catalogModels
++            ? createModels(...options.catalogModels)
++            : createModels(`${provider}-default`);
++          return {
++            ...catalog,
++            ...(options.unreachableProviders ? { UNREACHABLE_PROVIDERS: options.unreachableProviders } : {}),
++            ...(options.hiddenBuiltIns ? { HIDDEN_BUILT_IN_MODELS: options.hiddenBuiltIns } : {}),
++          };
+         },
+         getCurrentActiveModel: async (sessionId) => createCurrentActiveModel(
+           options.activeModel?.(provider, sessionId) ?? `${provider}-default`,
+@@ -392,6 +409,7 @@ test('allowed effort levels come from the provider, not from the built-in models
+     codex: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+     cursor: [],
+     opencode: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'thinking'],
++    pi: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+   };
+   for (const [provider, levels] of Object.entries(expectedLevels) as Array<[LLMProvider, string[]]>) {
+     assert.deepEqual((await service.getProviderModels(provider)).EFFORT_LEVELS, levels, provider);
+@@ -482,6 +500,7 @@ test('resolveSessionModel asks the provider adapter for the requested session',
+   const calls: Array<{ provider: LLMProvider; sessionId?: string }> = [];
+   const { service } = createTestService({
+     sessions: createSessionStore({ 'session-123': null }),
++    catalogModels: ['opencode-session-123'],
+     activeModel: (provider, sessionId) => {
+       calls.push({ provider, sessionId });
+       return `${provider}-${sessionId}`;
+@@ -544,6 +563,7 @@ test('setSessionEffort ignores sessions that have no row yet', () => {
+ test('resolveSessionModel prefers the recorded session model', async () => {
+   const { service } = createTestService({
+     sessions: createSessionStore({ 'session-1': 'haiku' }, { 'session-1': 'high' }),
++    catalogModels: ['haiku', 'sonnet'],
+     activeModel: () => 'provider-reported',
+   });
+ 
+@@ -560,6 +580,9 @@ test('resolveSessionModel prefers the recorded session model', async () => {
+ test('resolveSessionModel uses provider session state for unrecorded external sessions', async () => {
+   const { service } = createTestService({
+     sessions: createSessionStore({ 'session-1': null }),
++    // The adapter default must differ from what the adapter reports, or the
++    // "no answer" check below would swallow the provider-reported model.
++    catalogModels: ['opencode-default', 'provider-reported', 'requested'],
+     activeModel: () => 'provider-reported',
+   });
+ 
+@@ -575,6 +598,7 @@ test('resolveSessionModel uses provider session state for unrecorded external se
+ test('resolveSessionModel uses the requested model when provider reports the catalog default', async () => {
+   const { service } = createTestService({
+     sessions: createSessionStore({ 'session-1': null }),
++    catalogModels: ['haiku'],
+   });
+ 
+   const resolved = await service.resolveSessionModel('claude', {
+@@ -587,7 +611,7 @@ test('resolveSessionModel uses the requested model when provider reports the cat
+ });
+ 
+ test('resolveSessionModel returns a requested model before a session exists', async () => {
+-  const { service } = createTestService();
++  const { service } = createTestService({ catalogModels: ['gpt-5.5'] });
+ 
+   const resolved = await service.resolveSessionModel('codex', { requestedModel: 'gpt-5.5' });
+ 
+@@ -605,19 +629,49 @@ test('resolveSessionModel falls back to the provider adapter default', async ()
+   assert.equal(resolved.source, 'default');
+ });
+ 
+-test('resolveResumeModel prefers the recorded session model over the requested one', async () => {
++test('resolveResumeModel prefers the recorded session model when the catalog still lists it', async () => {
+   const { service } = createTestService({
+     sessions: createSessionStore({ 'session-456': 'composer-2' }),
++    catalogModels: ['composer-2', 'composer-2-fast'],
+   });
+ 
+   const model = await service.resolveResumeModel('cursor', 'session-456', 'composer-2-fast');
+   assert.equal(model, 'composer-2');
+ });
+ 
++test('resolveResumeModel replaces a recorded model the catalog no longer lists', async () => {
++  // A row outlives its model when a provider's catalog is discovered at
++  // runtime: pi reads its CLI, so a machine's own gateways define the list and
++  // an id recorded by an older build can point at a model that now 403s.
++  const { service, sessions } = createTestService({
++    sessions: createSessionStore({ 'session-456': 'retired-model' }),
++    catalogModels: ['current-model'],
++  });
++
++  const model = await service.resolveResumeModel('pi', 'session-456');
++  assert.equal(model, 'current-model');
++  // The stale recording is repaired, so the next resume skips the lookup.
++  assert.equal(sessions.getSessionById('session-456')?.model, 'current-model');
++});
++
++test('resolveResumeModel keeps an explicit composer choice over a stale recording', async () => {
++  const { service } = createTestService({
++    sessions: createSessionStore({ 'session-456': 'retired-model' }),
++    catalogModels: ['current-model', 'picked-model'],
++  });
++
++  const model = await service.resolveResumeModel('pi', 'session-456', 'picked-model');
++  assert.equal(model, 'picked-model');
++});
++
+ test('resolveResumeModel never consults provider-global state', async () => {
+   let providerLookups = 0;
+   const { service } = createTestService({
+     sessions: createSessionStore({ 'session-456': null }),
++    // The requested model must be catalogued, or the catalog check would
++    // substitute the default and this test would stop observing what it means
++    // to: that no provider-global state is read.
++    catalogModels: ['gpt-5.5'],
+     activeModel: () => {
+       providerLookups += 1;
+       return 'global-config-model';
+@@ -629,3 +683,102 @@ test('resolveResumeModel never consults provider-global state', async () => {
+   assert.equal(model, 'gpt-5.5');
+   assert.equal(providerLookups, 0);
+ });
++
++test('resolveResumeModel replaces a requested model the catalog does not offer', async () => {
++  // The composer sends whatever its browser remembers; a catalog discovered at
++  // runtime can have dropped that model since (pi drops providers that stop
++  // answering), so the request alone cannot be trusted either.
++  const { service } = createTestService({
++    sessions: createSessionStore({ 'session-456': null }),
++    catalogModels: ['current-model'],
++  });
++
++  const model = await service.resolveResumeModel('pi', 'session-456', 'retired-model');
++  assert.equal(model, 'current-model');
++});
++
++test('resolveResumeModel keeps a requested model the catalog still offers', async () => {
++  const { service } = createTestService({
++    sessions: createSessionStore({ 'session-456': null }),
++    catalogModels: ['current-model', 'picked-model'],
++  });
++
++  const model = await service.resolveResumeModel('pi', 'session-456', 'picked-model');
++  assert.equal(model, 'picked-model');
++});
++
++test('resolveSessionModel ignores a recorded model the catalog no longer offers', async () => {
++  // A pi session row can name a model whose provider stopped answering: the
++  // catalog is read from the live CLI, so it drops providers it cannot reach.
++  // Every display surface must report the catalog default instead, or the UI
++  // would show a model the next run cannot use.
++  const { service } = createTestService({
++    sessions: createSessionStore({ 'session-1': 'retired-model' }),
++    catalogModels: ['current-model'],
++  });
++
++  const resolved = await service.resolveSessionModel('pi', { sessionId: 'session-1' });
++
++  assert.equal(resolved.model, 'current-model');
++  assert.equal(resolved.source, 'default');
++});
++
++test('resolveResumeModel keeps a recorded model whose provider is merely unreachable', async () => {
++  // A reachability probe can fail transiently (offline, gateway starting, pi
++  // busy). The catalog reports those providers separately so a momentary
++  // failure is not mistaken for the model being gone — otherwise the session's
++  // recorded model would be rewritten and persisted for good.
++  const { service, sessions } = createTestService({
++    sessions: createSessionStore({ 'session-1': 'anthropic/claude-opus-4-5' }),
++    catalogModels: ['workbuddy/cn:auto'],
++    unreachableProviders: ['anthropic'],
++  });
++
++  const model = await service.resolveResumeModel('pi', 'session-1');
++
++  assert.equal(model, 'anthropic/claude-opus-4-5');
++  assert.equal(sessions.getSessionById('session-1')?.model, 'anthropic/claude-opus-4-5');
++});
++
++test('resolveSessionModel reports a withheld provider model rather than the default', async () => {
++  const { service } = createTestService({
++    sessions: createSessionStore({ 'session-1': 'anthropic/claude-opus-4-5' }),
++    catalogModels: ['workbuddy/cn:auto'],
++    unreachableProviders: ['anthropic'],
++  });
++
++  const resolved = await service.resolveSessionModel('pi', { sessionId: 'session-1' });
++
++  assert.equal(resolved.model, 'anthropic/claude-opus-4-5');
++});
++
++test('a custom-models-only catalog still rejects a model the provider dropped', async () => {
++  // Hiding built-ins must not also wave through ids that no longer exist: for a
++  // runtime-discovered catalog (pi) the hidden set is whatever the CLI listed,
++  // and an old id outside it is genuinely gone.
++  const { service } = createTestService({
++    sessions: createSessionStore({ 'session-1': 'gone-model' }),
++    catalogModels: ['built-in-a', 'built-in-b'],
++  });
++  // Custom-models-only only takes effect while a custom model exists.
++  await service.createCustomModel('claude', { model: 'My Model', id: 'my-model' });
++  await service.setCustomModelsOnly('claude', true);
++
++  const model = await service.resolveResumeModel('claude', 'session-1');
++
++  // 'gone-model' is neither listed nor a hidden built-in, so it is replaced.
++  assert.equal(model, 'my-model');
++});
++
++test('a custom-models-only catalog still honours a built-in it merely hid', async () => {
++  const { service } = createTestService({
++    sessions: createSessionStore({ 'session-1': 'built-in-a' }),
++    // The built-ins live in the adapter catalog; the merge derives the hidden
++    // set from it, so they must be listed here even though the picker hides them.
++    catalogModels: ['built-in-a', 'built-in-b'],
++  });
++  await service.createCustomModel('claude', { model: 'My Model', id: 'my-model' });
++  await service.setCustomModelsOnly('claude', true);
++
++  assert.equal(await service.resolveResumeModel('claude', 'session-1'), 'built-in-a');
++});
+diff --git a/server/modules/providers/tests/provider-runtime.service.test.ts b/server/modules/providers/tests/provider-runtime.service.test.ts
+index 78d3dd18..fe00a579 100644
+--- a/server/modules/providers/tests/provider-runtime.service.test.ts
++++ b/server/modules/providers/tests/provider-runtime.service.test.ts
+@@ -76,6 +76,7 @@ test('providerRegistry owns one runtime for every registered provider', () => {
+     'codex',
+     'cursor',
+     'opencode',
++    'pi',
+   ]);
+   assert.equal(providers.every((provider) => typeof provider.runtime.run === 'function'), true);
+   assert.equal(providers.every((provider) => typeof provider.runtime.abort === 'function'), true);

@@ -1,0 +1,3827 @@
+diff --git a/server/modules/providers/list/pi/pi-auth.provider.ts b/server/modules/providers/list/pi/pi-auth.provider.ts
+new file mode 100644
+index 00000000..f822cd82
+--- /dev/null
++++ b/server/modules/providers/list/pi/pi-auth.provider.ts
+@@ -0,0 +1,230 @@
++import type { ChildProcess } from 'node:child_process';
++import { StringDecoder } from 'node:string_decoder';
++
++import spawn from 'cross-spawn';
++
++import type { IProviderAuth } from '@/shared/interfaces.js';
++import type { CliVersionProbe, ProviderAuthStatus } from '@/shared/types.js';
++import { probeCliVersion } from '@/shared/utils.js';
++
++import { readInstalledPiModels } from './pi-models.provider.js';
++
++type PiCredentialsStatus = {
++  authenticated: boolean;
++  email: string | null;
++  method: string | null;
++};
++
++/** Timeouts match the probes' previous `spawn.sync` budgets. */
++const AUTH_CHECK_TIMEOUT_MS = 15_000;
++
++/**
++ * Fallback provider list for the credential probe, used only when the live
++ * model listing cannot be read.
++ *
++ * Normally the probe asks about exactly the providers the picker offers, which
++ * is what makes a machine's own `models.json` gateway count as "connected"
++ * instead of leaving the panel stuck on "not linked".
++ */
++const PI_FALLBACK_CHECKED_PROVIDERS = ['anthropic', 'zai-coding-cn', 'openai'] as const;
++
++/**
++ * Every environment variable pi 0.85.1 reads as a provider credential (its
++ * env API-key mapping, extracted from the installed package). pi resolves
++ * these itself — the adapter never sniffs the environment for an auth verdict,
++ * because only pi's own `auth check` can say whether a key is actually usable
++ * — so the list is the manifest tests (and any UI hint) scrub against to keep
++ * "no credentials" honest on machines with real keys exported.
++ *
++ * Deliberately excluded, though pi also reads them: `ANT_LING_API_KEY`,
++ * the `AWS_*` set and `OPENCODE_API_KEY` — they belong to special gateways and
++ * the AWS credential chain rather than a plain per-provider API key the UI
++ * could probe.
++ */
++export const PI_ENV_CREDENTIAL_KEYS: readonly string[] = [
++  'AI_GATEWAY_API_KEY',
++  'ANTHROPIC_API_KEY',
++  'ANTHROPIC_AUTH_TOKEN',
++  'ANTHROPIC_OAUTH_TOKEN',
++  'AZURE_OPENAI_API_KEY',
++  'BASETEN_API_KEY',
++  'CEREBRAS_API_KEY',
++  'DEEPSEEK_API_KEY',
++  'FIREWORKS_API_KEY',
++  'GEMINI_API_KEY',
++  'GROQ_API_KEY',
++  'KIMI_API_KEY',
++  'MINIMAX_API_KEY',
++  'MISTRAL_API_KEY',
++  'MOONSHOT_API_KEY',
++  'NVIDIA_API_KEY',
++  'OPENAI_API_KEY',
++  'OPENROUTER_API_KEY',
++  'QWEN_TOKEN_PLAN_API_KEY',
++  'QWEN_TOKEN_PLAN_CN_API_KEY',
++  'TOGETHER_API_KEY',
++  'XAI_API_KEY',
++  'XIAOMI_API_KEY',
++  'XIAOMI_TOKEN_PLAN_AMS_API_KEY',
++  'XIAOMI_TOKEN_PLAN_CN_API_KEY',
++  'XIAOMI_TOKEN_PLAN_SGP_API_KEY',
++  'ZAI_API_KEY',
++  'ZAI_CODING_CN_API_KEY',
++];
++
++/** Shape of one `pi auth check --json` result (pi 0.85.1). */
++type PiAuthCheckResult = {
++  status?: unknown;
++  authType?: unknown;
++};
++
++/** One `pi …` probe outcome: `ok` means exit 0 with the stdout it produced. */
++type PiCliProbe = {
++  ok: boolean;
++  stdout: string | null;
++};
++
++/**
++ * Spawns one `pi` probe without blocking the event loop.
++ *
++ * Keeps the error tolerance the probes' previous `spawn.sync` calls had: any
++ * failure (ENOENT, non-zero exit, timeout — the child is killed on expiry)
++ * resolves to `ok: false` instead of throwing, because "not installed" and
++ * "not authenticated" are answers, not errors.
++ */
++async function probePi(args: string[], timeoutMs: number): Promise<PiCliProbe> {
++  let child: ChildProcess;
++  try {
++    child = spawn('pi', args, { stdio: ['ignore', 'pipe', 'ignore'] });
++  } catch {
++    return { ok: false, stdout: null };
++  }
++
++  return new Promise((resolve) => {
++    const decoder = new StringDecoder('utf8');
++    let stdout = '';
++    let settled = false;
++    let timer: NodeJS.Timeout;
++
++    const settle = (result: PiCliProbe): void => {
++      if (settled) {
++        return;
++      }
++
++      settled = true;
++      clearTimeout(timer);
++      resolve(result);
++    };
++
++    // Killing on expiry mirrors spawn.sync's timeout: a hung pi must not hold
++    // the status request open forever.
++    timer = setTimeout(() => {
++      child.kill('SIGTERM');
++      settle({ ok: false, stdout: null });
++    }, timeoutMs);
++
++    child.stdout?.on('data', (chunk: Buffer) => {
++      stdout += decoder.write(chunk);
++    });
++    // ENOENT (or an unlaunchable binary) is "not installed", not a crash.
++    child.on('error', () => settle({ ok: false, stdout: null }));
++    child.on('close', (code) => {
++      settle({ ok: code === 0, stdout: code === 0 ? stdout + decoder.end() : null });
++    });
++  });
++}
++
++export class PiProviderAuth implements IProviderAuth {
++  /**
++   * Checks whether the pi CLI is available to the server process, and which
++   * version it is. Synchronous by contract: the CLI update service calls this
++   * on every provider status request and only needs `--version`.
++   */
++  checkInstalled(): CliVersionProbe {
++    const probe = probeCliVersion('pi');
++    return { ...probe, installed: probe.exitCode === 0 };
++  }
++
++  /**
++   * Returns pi CLI installation and credential status.
++   *
++   * Unauthenticated is pi's normal first-run state rather than a failure, so no
++   * error string is reported for it.
++   */
++  async getStatus(): Promise<ProviderAuthStatus> {
++    const { installed, version: installedVersion } = this.checkInstalled();
++    // A missing binary cannot answer `auth check` either; probing would just
++    // burn three ENOENT spawns.
++    const credentials = installed ? await this.checkCredentials() : { authenticated: false, email: null, method: null };
++
++    return {
++      installed,
++      provider: 'pi',
++      installedVersion,
++      authenticated: credentials.authenticated,
++      // pi has no account identity: credentials are a local auth store or an
++      // API key, so there is never an email to show.
++      email: credentials.email,
++      method: credentials.method,
++    };
++  }
++
++  /**
++   * Probes pi's credentials through its own `auth check` contract.
++   *
++   * pi 0.85.1 resolves typed provider entries through its credential store
++   * (including env API keys), so an empty or malformed `auth.json` no longer
++   * implies usable credentials — only pi's own resolver can answer that.
++   * Refresh behavior is left at pi's default (the same thing a real run does
++   * for expired OAuth tokens). The first ready provider wins.
++   */
++  private async checkCredentials(): Promise<PiCredentialsStatus> {
++    for (const provider of await this.listCandidateProviders()) {
++      const result = await probePi(
++        ['auth', 'check', '--provider', provider, '--json'],
++        AUTH_CHECK_TIMEOUT_MS,
++      );
++
++      if (!result.ok || result.stdout === null) {
++        continue;
++      }
++
++      let parsed: PiAuthCheckResult;
++      try {
++        parsed = JSON.parse(result.stdout) as PiAuthCheckResult;
++      } catch {
++        continue;
++      }
++
++      if (parsed.status !== 'ready') {
++        continue;
++      }
++
++      const method = typeof parsed.authType === 'string' && parsed.authType.length > 0
++        ? parsed.authType
++        : null;
++      return { authenticated: true, email: null, method };
++    }
++
++    return { authenticated: false, email: null, method: null };
++  }
++
++  /**
++   * The providers worth asking pi about: every provider the live model listing
++   * names, in listing order, falling back to the built-in set when the CLI
++   * could not be read. Duplicates are dropped so a gateway with many models
++   * costs one probe, not one per model.
++   */
++  private async listCandidateProviders(): Promise<string[]> {
++    const references = await readInstalledPiModels().catch(() => [] as string[]);
++    const fromListing = references
++      .map((reference) => reference.split('/')[0])
++      .filter((provider): provider is string => Boolean(provider));
++
++    const candidates = fromListing.length > 0
++      ? fromListing
++      : [...PI_FALLBACK_CHECKED_PROVIDERS];
++
++    return [...new Set(candidates)];
++  }
++}
+diff --git a/server/modules/providers/list/pi/pi-mcp.provider.ts b/server/modules/providers/list/pi/pi-mcp.provider.ts
+new file mode 100644
+index 00000000..1fb8870f
+--- /dev/null
++++ b/server/modules/providers/list/pi/pi-mcp.provider.ts
+@@ -0,0 +1,54 @@
++import { McpProvider } from '@/modules/providers/shared/mcp/mcp.provider.js';
++import type { McpScope, ProviderMcpServer, UpsertProviderMcpServerInput } from '@/shared/types.js';
++import { AppError } from '@/shared/utils.js';
++
++/**
++ * MCP adapter for pi.
++ *
++ * pi has no MCP integration at all: the facet registers with no supported
++ * scopes or transports, so the shared base answers reads with the empty set.
++ * Every read/write hook and both public write entry points reject with
++ * `NOT_SUPPORTED` so nothing can mistake "no servers configured" for "pi
++ * cannot do MCP".
++ */
++export class PiMcpProvider extends McpProvider {
++  constructor() {
++    super('pi', [], []);
++  }
++
++  async upsertServer(_input: UpsertProviderMcpServerInput): Promise<ProviderMcpServer> {
++    throw new AppError('Pi does not support MCP', { code: 'NOT_SUPPORTED', statusCode: 400 });
++  }
++
++  async removeServer(_input: {
++    name: string;
++    scope?: McpScope;
++    workspacePath?: string;
++  }): Promise<{ removed: boolean; provider: 'pi'; name: string; scope: McpScope }> {
++    throw new AppError('Pi does not support MCP', { code: 'NOT_SUPPORTED', statusCode: 400 });
++  }
++
++  protected async readScopedServers(_scope: McpScope, _workspacePath: string): Promise<Record<string, unknown>> {
++    throw new AppError('Pi does not support MCP', { code: 'NOT_SUPPORTED', statusCode: 400 });
++  }
++
++  protected async writeScopedServers(
++    _scope: McpScope,
++    _workspacePath: string,
++    _servers: Record<string, unknown>,
++  ): Promise<void> {
++    throw new AppError('Pi does not support MCP', { code: 'NOT_SUPPORTED', statusCode: 400 });
++  }
++
++  protected buildServerConfig(_input: UpsertProviderMcpServerInput): Record<string, unknown> {
++    throw new AppError('Pi does not support MCP', { code: 'NOT_SUPPORTED', statusCode: 400 });
++  }
++
++  protected normalizeServerConfig(
++    _scope: McpScope,
++    _name: string,
++    _rawConfig: unknown,
++  ): ProviderMcpServer | null {
++    throw new AppError('Pi does not support MCP', { code: 'NOT_SUPPORTED', statusCode: 400 });
++  }
++}
+diff --git a/server/modules/providers/list/pi/pi-models.provider.test.ts b/server/modules/providers/list/pi/pi-models.provider.test.ts
+new file mode 100644
+index 00000000..b2f47d7c
+--- /dev/null
++++ b/server/modules/providers/list/pi/pi-models.provider.test.ts
+@@ -0,0 +1,132 @@
++import assert from 'node:assert/strict';
++import test from 'node:test';
++
++import {
++  PiProviderModels,
++  PI_PREDEFINED_MODELS,
++  parsePiModelListing,
++} from './pi-models.provider.js';
++
++test('parsePiModelListing keeps provider/model references and drops the header', () => {
++  const output = [
++    'provider   model                   context  max-out  thinking  images',
++    'anthropic  claude-sonnet-4-5       200K     64K      yes       yes   ',
++    'workbuddy  cn:deepseek-v4.1-flash  1.0M     393.2K   yes       yes   ',
++    '',
++    'pi: warning: something went wrong',
++    '   truncated',
++  ].join('\r\n');
++
++  assert.deepEqual(parsePiModelListing(output), [
++    'anthropic/claude-sonnet-4-5',
++    // A gateway model id keeps its colon and dot verbatim.
++    'workbuddy/cn:deepseek-v4.1-flash',
++  ]);
++});
++
++test('parsePiModelListing deduplicates repeated references', () => {
++  const output = 'workbuddy  cn:auto  1M\nworkbuddy  cn:auto  1M\n';
++  assert.deepEqual(parsePiModelListing(output), ['workbuddy/cn:auto']);
++});
++
++test('parsePiModelListing returns nothing for empty or malformed output', () => {
++  assert.deepEqual(parsePiModelListing(''), []);
++  assert.deepEqual(parsePiModelListing('onlyonecolumn\n'), []);
++  assert.deepEqual(parsePiModelListing('provider  model  context\n'), []);
++});
++
++/** A catalog adapter over a fixed listing, so no CLI is spawned. */
++const createModels = (references: string[], unreachableProviders: string[] = []) => new PiProviderModels(
++  async () => references,
++  () => Date.now(),
++  // Reachability is a real CLI run; these tests cover catalog assembly, so
++  // they pass references through untouched.
++  async (listed) => ({ references: listed, unreachableProviders }),
++);
++
++test('getSupportedModels builds the catalog from the live listing', async () => {
++  const models = createModels([
++    'workbuddy/cn:auto',
++    'workbuddy/cn:glm-5.3',
++  ]);
++
++  const catalog = await models.getSupportedModels();
++  assert.equal(catalog.OPTIONS.length, 2);
++  assert.deepEqual(catalog.OPTIONS[0], {
++    value: 'workbuddy/cn:auto',
++    label: 'cn:auto',
++    description: 'workbuddy',
++  });
++  // A gateway-only machine defaults to its own first model.
++  assert.equal(catalog.DEFAULT, 'workbuddy/cn:auto');
++});
++
++test('getSupportedModels keeps predefined labels for known models', async () => {
++  const models = createModels([
++    'anthropic/claude-sonnet-4',
++    'workbuddy/cn:auto',
++  ]);
++
++  const catalog = await models.getSupportedModels();
++  const predefined = PI_PREDEFINED_MODELS.OPTIONS.find((option) => option.value === 'anthropic/claude-sonnet-4');
++  assert.deepEqual(catalog.OPTIONS[0], predefined);
++});
++
++test('getSupportedModels prefers the provider the user configured in models.json', async () => {
++  // `pi auth check` cannot be trusted here: it reports anthropic ready whenever
++  // an ANTHROPIC_AUTH_TOKEN is in the environment, even when its requests are
++  // refused. The user's own models.json provider is the reliable signal.
++  const models = createModels([
++    'anthropic/claude-sonnet-4',
++    'workbuddy/cn:auto',
++    'workbuddy/cn:glm-5.3',
++  ]);
++
++  const catalog = await models.getSupportedModels();
++  assert.match(catalog.DEFAULT, /^workbuddy\//);
++});
++
++test('getSupportedModels falls back to the static catalog when the CLI cannot be read', async () => {
++  const models = createModels([]);
++
++  const catalog = await models.getSupportedModels();
++  assert.deepEqual(catalog, PI_PREDEFINED_MODELS);
++});
++
++test('parsePiModelListing rejects diagnostic lines that look like two columns', () => {
++  // pi prints warnings to the same stream; `pi: warning: …` would otherwise
++  // read as provider `pi:` with model `warning:`.
++  assert.deepEqual(parsePiModelListing('pi: warning: no config\n'), []);
++});
++
++test('parsePiModelListing rejects the "no models available" notice', () => {
++  // pi exits 0 and prints this when no provider has usable credentials. Its
++  // first two words look like an id pair, so it must be rejected explicitly.
++  const output = [
++    'No models available. Use /login to log into a provider via OAuth or API key. See:',
++    '  C:/pi/docs/providers.md',
++    '  C:/pi/docs/models.md',
++  ].join('\n');
++
++  assert.deepEqual(parsePiModelListing(output), []);
++});
++
++test('parsePiModelListing keeps model ids that contain a slash', () => {
++  // pi's own catalog names models `provider/family-model`; dropping them would
++  // hide almost every OpenRouter/HuggingFace entry from the picker.
++  const output = [
++    'provider    model                                 context  max-out  thinking  images',
++    'openrouter  ~anthropic/claude-sonnet-latest       1M       128K     yes       yes',
++    'openrouter  deepseek/deepseek-v4-flash            1.0M     943.7K   yes       yes',
++  ].join('\n');
++
++  assert.deepEqual(parsePiModelListing(output), [
++    'openrouter/~anthropic/claude-sonnet-latest',
++    'openrouter/deepseek/deepseek-v4-flash',
++  ]);
++});
++
++test('parsePiModelListing keeps gateway ids that use a colon', () => {
++  const output = 'workbuddy  cn:deepseek-v4.1-flash  1.0M  393.2K  yes  yes';
++  assert.deepEqual(parsePiModelListing(output), ['workbuddy/cn:deepseek-v4.1-flash']);
++});
+diff --git a/server/modules/providers/list/pi/pi-models.provider.ts b/server/modules/providers/list/pi/pi-models.provider.ts
+new file mode 100644
+index 00000000..473b6a06
+--- /dev/null
++++ b/server/modules/providers/list/pi/pi-models.provider.ts
+@@ -0,0 +1,542 @@
++import type { ChildProcess } from 'node:child_process';
++import { readFile } from 'node:fs/promises';
++import { closeSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
++import os from 'node:os';
++import path from 'node:path';
++
++import spawn from 'cross-spawn';
++
++import type { IProviderModels } from '@/shared/interfaces.js';
++import type {
++  ProviderCurrentActiveModel,
++  ProviderModelsDefinition,
++  ProviderModelOption,
++} from '@/shared/types.js';
++import { buildDefaultProviderCurrentActiveModel, getPiAgentDir } from '@/shared/utils.js';
++
++/**
++ * Fallback catalog used only when `pi --list-models` cannot be read.
++ *
++ * The live catalog comes from the CLI (see `readInstalledPiModels`), which is
++ * what makes a machine's own `models.json` providers — a local gateway, for
++ * example — show up in the picker at all. This static list is the last resort
++ * for an uninstalled or broken CLI; it deliberately stays small, because every
++ * entry here is a model the machine may not have credentials for.
++ */
++export const PI_PREDEFINED_MODELS: ProviderModelsDefinition = {
++  OPTIONS: [
++    { value: 'anthropic/claude-sonnet-4-5', label: 'Claude Sonnet 4.5', description: 'Anthropic', effort: { values: [] } },
++    { value: 'anthropic/claude-sonnet-4', label: 'Claude Sonnet 4', description: 'Anthropic', effort: { values: [] } },
++    { value: 'anthropic/claude-haiku-4-5', label: 'Claude Haiku 4.5', description: 'Anthropic', effort: { values: [] } },
++    { value: 'anthropic/claude-haiku-3-5', label: 'Claude Haiku 3.5', description: 'Anthropic', effort: { values: [] } },
++    { value: 'anthropic/claude-opus-4-5', label: 'Claude Opus 4.5', description: 'Anthropic', effort: { values: [] } },
++    { value: 'anthropic/claude-opus-4-1', label: 'Claude Opus 4.1', description: 'Anthropic', effort: { values: [] } },
++    { value: 'zai-coding-cn/glm-5.3', label: 'GLM 5.3', description: 'Z.ai Coding CN', effort: { values: [] } },
++    { value: 'zai-coding-cn/glm-5.3-flash', label: 'GLM 5.3 Flash', description: 'Z.ai Coding CN', effort: { values: [] } },
++    { value: 'zai-coding-cn/glm-5.2', label: 'GLM 5.2', description: 'Z.ai Coding CN', effort: { values: [] } },
++    // pi's catalog has no bare `gpt-5.6` — the 5.6 generation ships as
++    // luna/sol/terra tiers (sol is the flagship), so only concrete ids are
++    // listed. Verified against the pi 0.85.1 model catalog.
++    { value: 'openai/gpt-5.6-sol', label: 'GPT-5.6 Sol', description: 'OpenAI', effort: { values: [] } },
++    { value: 'openai/gpt-5.4', label: 'GPT-5.4', description: 'OpenAI', effort: { values: [] } },
++    { value: 'openai/gpt-5.4-mini', label: 'GPT-5.4 mini', description: 'OpenAI', effort: { values: [] } },
++  ],
++  DEFAULT: 'anthropic/claude-sonnet-4',
++};
++
++/** How long a successful `pi --list-models` reading stays fresh. */
++const PI_MODELS_CACHE_TTL_MS = 5 * 60_000;
++
++/** A failed reading is retried sooner, so a just-installed CLI shows up quickly. */
++const PI_MODELS_EMPTY_CACHE_TTL_MS = 30_000;
++
++/** `pi --list-models` shells out; a hung one must not hold a picker load open. */
++const PI_MODELS_TIMEOUT_MS = 20_000;
++
++/**
++ * Reads the models the local pi can actually address, by running its own
++ * `pi --list-models`.
++ *
++ * The output is a fixed-width table whose first column is the provider id and
++ * second the model id; this returns their `provider/model` references. The
++ * output is treated as untrusted: a line counts only when both columns are
++ * present and the header row is skipped, so a warning or a partial write
++ * cannot become a phantom model.
++ *
++ * Writing to a temp file rather than a pipe follows the OpenCode adapter: a
++ * pipe is a socket that buffers only a few small writes, and a listing longer
++ * than that arrives truncated on a busy host.
++ */
++export const readInstalledPiModels = async (): Promise<string[]> => {
++  const outputDir = mkdtempSync(path.join(os.tmpdir(), 'cloudcli-pi-models-'));
++  try {
++    const outputPath = path.join(outputDir, 'models.txt');
++    const output = openSync(outputPath, 'w');
++    let child: ChildProcess;
++    try {
++      child = spawn('pi', ['--list-models'], { stdio: ['ignore', output, 'ignore'], shell: false });
++    } finally {
++      // The child holds its own handle on the file.
++      closeSync(output);
++    }
++
++    const exitCode = await new Promise<number | null>((resolve) => {
++      const timeout = setTimeout(() => {
++        child.kill();
++        resolve(null);
++      }, PI_MODELS_TIMEOUT_MS);
++      let settled = false;
++      const finish = (code: number | null): void => {
++        // The timeout kills the child, whose own `close` follows; only the
++        // first outcome is the run's.
++        if (settled) {
++          return;
++        }
++        settled = true;
++        clearTimeout(timeout);
++        resolve(code);
++      };
++      child.on('error', () => finish(null));
++      child.on('close', finish);
++    });
++
++    // A killed or failed run may have written part of a listing, which must not
++    // be cached as a complete one.
++    if (exitCode !== 0) {
++      return [];
++    }
++
++    return parsePiModelListing(readFileSync(outputPath, 'utf8'));
++  } catch {
++    return [];
++  } finally {
++    removeTempDir(outputDir);
++  }
++};
++
++/**
++ * Shape of a model id in pi's listing.
++ *
++ * Model ids are identifiers and may contain `/`: pi's own catalog names models
++ * as `provider/family-model` (`~anthropic/claude-sonnet-latest`,
++ * `deepseek/deepseek-v4-flash`), and a gateway adds `:` (workbuddy's
++ * `cn:deepseek-v4.1-flash`). A leading `~` marks pi's alias entries, so it is
++ * allowed too. They never contain whitespace, which is what separates columns.
++ */
++const PI_MODEL_ID_PATTERN = /^[A-Za-z0-9~][A-Za-z0-9._:/~-]*$/;
++
++/** Provider ids are the same shape minus the model-segment characters. */
++const PI_PROVIDER_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
++
++/**
++ * Turns `pi --list-models` output into `provider/model` references.
++ *
++ * Rows are whitespace-separated with the provider and model in the first two
++ * columns. The output is deliberately treated as untrusted — pi prints prose on
++ * this stream too:
++ *
++ * - With no usable credentials pi exits 0 with `No models available. Use
++ *   /login …`, whose first two words are shaped like an id pair. Accepting it
++ *   would make the picker offer a model called `No/models` and default a new
++ *   chat to it.
++ * - Warnings arrive as `pi: warning: …`.
++ *
++ * Requiring the first cell to be a provider id, the second a model id, and at
++ * least one numeric sizing column (`context` / `max-out`) rejects both: prose
++ * rows carry neither a size nor a two-token id pair.
++ */
++export const parsePiModelListing = (output: string): string[] => {
++  const references: string[] = [];
++  const seen = new Set<string>();
++
++  for (const line of output.split(/\r?\n/)) {
++    const cells = line.trim().split(/\s+/);
++    if (cells.length < 2) {
++      continue;
++    }
++
++    const [providerId, modelId, ...rest] = cells;
++    if (!PI_PROVIDER_ID_PATTERN.test(providerId) || !PI_MODEL_ID_PATTERN.test(modelId)) {
++      continue;
++    }
++    // The header row is literally `provider model …`; a diagnostic prefixes the
++    // provider with a colon (`pi: warning: …`) rather than being one.
++    if (providerId === 'provider' || providerId.endsWith(':')) {
++      continue;
++    }
++    // A real row carries numeric sizing columns after the id pair
++    // (`1M`, `204.8K`, `128K`). Prose such as the "no models" notice does not.
++    if (!rest.some((cell) => /^\d+(?:\.\d+)?[KMG]?$/i.test(cell))) {
++      continue;
++    }
++
++    const value = `${providerId}/${modelId}`;
++    if (seen.has(value)) {
++      continue;
++    }
++
++    seen.add(value);
++    references.push(value);
++  }
++
++  return references;
++};
++
++/**
++ * Removes a probe's temp directory without ever throwing.
++ *
++ * On Windows `child.kill()` stops only the `pi.cmd` shim; the node child behind
++ * it can still hold the files, so removal races the OS. This runs inside timer
++ * and event callbacks, where a throw becomes an uncaught exception and — worse
++ * — leaves the promise below unsettled, which would make every later catalog
++ * read reuse a promise that never completes.
++ */
++const removeTempDir = (dir: string): void => {
++  try {
++    rmSync(dir, { recursive: true, force: true });
++  } catch {
++    // Best effort: a leaked temp directory is preferable to a stuck catalog.
++  }
++};
++
++/** How long a successful verdict stays fresh. */
++const PI_REACHABILITY_CACHE_TTL_MS = 10 * 60_000;
++
++/**
++ * A failing verdict is retried far sooner than a passing one.
++ *
++ * The probe can fail for reasons that have nothing to do with the provider —
++ * the machine was briefly offline, the gateway was still starting, pi was busy
++ * with another run — and caching that failure for the full window would make
++ * the provider's models vanish from the picker with no way to bring them back
++ * except waiting. A passing verdict is the stable case, so only it earns the
++ * long TTL.
++ */
++const PI_REACHABILITY_FAILURE_TTL_MS = 60_000;
++
++/** One probe sends a trivial prompt; a slow gateway must not hold a load open. */
++const PI_REACHABILITY_TIMEOUT_MS = 30_000;
++
++/**
++ * What a provider that answered leaves in the probe's event stream.
++ *
++ * pi finishes a turn with `stopReason: "stop"`; a refused or unknown model
++ * finishes it with `"error"` instead. Requiring the positive marker is what
++ * separates "answered" from "started up and immediately failed", which the
++ * absence of an error marker cannot do — a failed startup writes no
++ * `stopReason` line at all.
++ */
++const PI_REACHABILITY_SUCCESS_MARKER = '"stopReason":"stop"';
++
++/**
++ * Whether one provider can actually answer right now, keyed by provider id.
++ *
++ * `pi --list-models` lists what is *configured*, not what is *reachable*: with
++ * an `ANTHROPIC_AUTH_TOKEN` exported, all eighteen anthropic models appear
++ * while every request is refused with 403. Probing costs one tiny run per
++ * provider (not per model), so the verdict is cached per provider and the
++ * picker only ever offers providers proven to answer.
++ */
++const reachableProviders = new Map<string, { reachable: boolean; expiresAt: number }>();
++
++/** In-flight probes, so concurrent picker loads share one run per provider. */
++const pendingReachability = new Map<string, Promise<boolean>>();
++
++const probeProviderReachable = (provider: string, model: string): Promise<boolean> => {
++  const cached = reachableProviders.get(provider);
++  if (cached && Date.now() < cached.expiresAt) {
++    return Promise.resolve(cached.reachable);
++  }
++
++  const pending = pendingReachability.get(provider);
++  if (pending) {
++    return pending;
++  }
++
++  const probe = new Promise<boolean>((resolve) => {
++    const outputDir = mkdtempSync(path.join(os.tmpdir(), 'cloudcli-pi-reach-'));
++    const outputPath = path.join(outputDir, 'probe.jsonl');
++    let child: ChildProcess;
++    try {
++      const output = openSync(outputPath, 'w');
++      try {
++        child = spawn(
++          'pi',
++          ['-p', '--mode', 'json', '--no-session', '--no-tools', '--model', `${provider}/${model}`, 'hi'],
++          { stdio: ['ignore', output, 'ignore'], shell: false },
++        );
++      } finally {
++        closeSync(output);
++      }
++    } catch {
++      removeTempDir(outputDir);
++      resolve(false);
++      return;
++    }
++
++    // Declared before `finish` because the timeout callback and the child's
++    // events both call it, and `finish` clears the timer.
++    let timeout: NodeJS.Timeout;
++    // A probe can settle more than once — the timeout kills the child and the
++    // kill's own `close` event follows — so only the first verdict counts.
++    let settled = false;
++
++    const finish = (reachable: boolean): void => {
++      if (settled) {
++        return;
++      }
++      settled = true;
++      clearTimeout(timeout);
++      reachableProviders.set(provider, {
++        reachable,
++        expiresAt: Date.now() + (reachable ? PI_REACHABILITY_CACHE_TTL_MS : PI_REACHABILITY_FAILURE_TTL_MS),
++      });
++      removeTempDir(outputDir);
++      resolve(reachable);
++    };
++
++    timeout = setTimeout(() => {
++      child.kill();
++      finish(false);
++    }, PI_REACHABILITY_TIMEOUT_MS);
++
++    child.on('error', () => finish(false));
++    child.on('close', (code) => {
++      // Reachable means "the provider answered", which is a positive signal:
++      // the model produced a stopped assistant turn. Absence of an error marker
++      // is not enough — a missing credential or an unknown model makes pi exit
++      // non-zero having written only a session header (or nothing at all), and
++      // both cases contain no `stopReason` line to notice.
++      if (code !== 0) {
++        finish(false);
++        return;
++      }
++      try {
++        const output = readFileSync(outputPath, 'utf8');
++        finish(output.includes(PI_REACHABILITY_SUCCESS_MARKER));
++      } catch {
++        finish(false);
++      }
++    });
++  }).finally(() => {
++    pendingReachability.delete(provider);
++  });
++
++  pendingReachability.set(provider, probe);
++  return probe;
++};
++
++/**
++ * Drops providers that cannot answer, probing each one at most once per TTL.
++ *
++ * Keep-alive: a machine where nothing answers keeps the full listing rather
++ * than emptying the picker, so the failure is visible and inspectable instead
++ * of looking like an unconfigured provider.
++ */
++const filterReachableReferences = async (
++  references: string[],
++): Promise<{ references: string[]; unreachableProviders: string[] }> => {
++  const byProvider = new Map<string, string[]>();
++  for (const reference of references) {
++    const provider = reference.slice(0, reference.indexOf('/'));
++    const list = byProvider.get(provider);
++    if (list) {
++      list.push(reference);
++    } else {
++      byProvider.set(provider, [reference]);
++    }
++  }
++
++  const verdicts = await Promise.all(
++    [...byProvider.entries()].map(async ([provider, providerReferences]) => {
++      const firstModel = providerReferences[0].slice(providerReferences[0].indexOf('/') + 1);
++      return [provider, await probeProviderReachable(provider, firstModel)] as const;
++    }),
++  );
++
++  const reachable = new Set(verdicts.filter(([, ok]) => ok).map(([provider]) => provider));
++  const unreachableProviders = verdicts.filter(([, ok]) => !ok).map(([provider]) => provider);
++  if (reachable.size === 0) {
++    // Keep-alive: a machine where nothing answers shows the full list rather
++    // than an empty picker, so the failure is inspectable. Every provider is
++    // reported unreachable so callers do not treat the withheld list as final.
++    return { references, unreachableProviders };
++  }
++
++  return {
++    references: references.filter((reference) => reachable.has(reference.slice(0, reference.indexOf('/')))),
++    unreachableProviders,
++  };
++};
++
++/**
++ * Builds the picker catalog from live model references.
++ *
++ * Labels keep the model id and the description names the provider, so a
++ * machine with several gateways can tell `cn:glm-5.3` (workbuddy) from a
++ * same-named model elsewhere. Predefined entries keep their friendlier label.
++ */
++const createDiscoveredPiModels = (modelReferences: string[]): ProviderModelsDefinition | null => {
++  const predefinedByValue = new Map(
++    PI_PREDEFINED_MODELS.OPTIONS.map((option) => [option.value, option]),
++  );
++
++  const options: ProviderModelOption[] = [];
++  for (const value of modelReferences) {
++    const predefined = predefinedByValue.get(value);
++    if (predefined) {
++      options.push(predefined);
++      continue;
++    }
++
++    const separator = value.indexOf('/');
++    const providerId = value.slice(0, separator);
++    const modelId = value.slice(separator + 1);
++    const predefinedProvider = PREDEFINED_PROVIDER_LABELS.get(providerId);
++    options.push({
++      value,
++      label: modelId,
++      description: predefinedProvider ?? providerId,
++    });
++  }
++
++  return options.length > 0
++    ? { OPTIONS: options, DEFAULT: options[0].value }
++    : null;
++};
++
++/** Display names for the providers the static catalog already knows. */
++const PREDEFINED_PROVIDER_LABELS = new Map<string, string>([
++  ['anthropic', 'Anthropic'],
++  ['openai', 'OpenAI'],
++  ['zai-coding-cn', 'Z.ai Coding CN'],
++]);
++
++/**
++ * Provider ids the user declared in pi's own `models.json`, which is where a
++ * local gateway such as a `workbuddy` entry lives. Those entries carry their
++ * own `baseUrl` and `apiKey`, so they are the best default-model candidates.
++ *
++ * An unreadable or malformed file simply contributes nothing.
++ */
++const readUserConfiguredPiProviders = async (): Promise<string[]> => {
++  const providersPath = path.join(getPiAgentDir(), 'models.json');
++  try {
++    const parsed = JSON.parse(await readFile(providersPath, 'utf8')) as {
++      providers?: Record<string, unknown>;
++    };
++    return Object.keys(parsed.providers ?? {});
++  } catch {
++    return [];
++  }
++};
++
++/** Provider registry model adapter for pi: live CLI catalog, static fallback. */
++export class PiProviderModels implements IProviderModels {
++  /** Last `pi --list-models` listing and when it stops being fresh. */
++  private cachedModelReferences: { references: string[]; expiresAt: number } | null = null;
++
++  /** In-flight CLI read, shared so concurrent picker loads spawn one process. */
++  private pendingModelReferences: Promise<string[]> | null = null;
++
++  constructor(
++    private readonly readModels = readInstalledPiModels,
++    private readonly now: () => number = Date.now,
++    private readonly filterReachable = filterReachableReferences,
++  ) {}
++
++  private refreshModelReferences(): Promise<string[]> {
++    this.pendingModelReferences ??= this.readModels()
++      // The picker stays available when the CLI invocation fails.
++      .catch(() => [] as string[])
++      .then((listed) => {
++        // A failed refresh keeps the last good listing, retried on the short
++        // schedule, instead of putting the static catalog back in the picker.
++        const references = listed.length > 0
++          ? listed
++          : this.cachedModelReferences?.references ?? [];
++        const ttl = listed.length > 0
++          ? PI_MODELS_CACHE_TTL_MS
++          : PI_MODELS_EMPTY_CACHE_TTL_MS;
++        this.cachedModelReferences = { references, expiresAt: this.now() + ttl };
++        return references;
++      })
++      .finally(() => {
++        this.pendingModelReferences = null;
++      });
++    return this.pendingModelReferences;
++  }
++
++  /**
++   * Serves the cached CLI listing, refreshing it in the background once stale.
++   *
++   * `pi --list-models` takes a moment and every picker load asks for the
++   * catalog, so only the first read after startup waits on the CLI.
++   */
++  private async readModelReferences(): Promise<string[]> {
++    if (!this.cachedModelReferences) {
++      return this.refreshModelReferences();
++    }
++    if (this.now() >= this.cachedModelReferences.expiresAt) {
++      void this.refreshModelReferences();
++    }
++    return this.cachedModelReferences.references;
++  }
++
++  async getSupportedModels(): Promise<ProviderModelsDefinition> {
++    const filtered = await this.filterReachable(await this.readModelReferences());
++    const references = filtered.references;
++    const discovered = createDiscoveredPiModels(references);
++    // Report the withheld providers so a consumer never reads a missing model as
++    // "gone" while its provider merely failed a probe (see the type's comment).
++    const unreachable = filtered.unreachableProviders.length > 0
++      ? { UNREACHABLE_PROVIDERS: filtered.unreachableProviders }
++      : {};
++    if (!discovered) {
++      return { ...PI_PREDEFINED_MODELS, ...unreachable };
++    }
++
++    // The listing is alphabetical by provider, so its first entry can be one
++    // this machine cannot actually use (anthropic on a gateway-only setup).
++    // A brand-new chat would then fail its first message, so prefer a model
++    // from a provider the user configured themselves.
++    const preferredProvider = await this.findPreferredProvider(references);
++    const defaultModel = preferredProvider
++      ? discovered.OPTIONS.find((option) => option.value.startsWith(`${preferredProvider}/`))?.value
++      : undefined;
++
++    return {
++      ...(defaultModel ? { ...discovered, DEFAULT: defaultModel } : discovered),
++      ...unreachable,
++    };
++  }
++
++  /**
++   * The provider a new chat should default to: the first one the user declared
++   * in `models.json`, otherwise the first one listed.
++   *
++   * `pi auth check` is deliberately not consulted here. It answers "is a
++   * credential present", not "does it work": an `ANTHROPIC_AUTH_TOKEN` in the
++   * server's environment makes anthropic report `ready` while its requests are
++   * refused with 403. A provider the user configured in `models.json` is the
++   * only signal that is both explicit and backed by a real base URL and key.
++   */
++  private async findPreferredProvider(references: string[]): Promise<string | null> {
++    const listed = [...new Set(references.map((reference) => reference.split('/')[0]))]
++      .filter(Boolean);
++    if (listed.length === 0) {
++      return null;
++    }
++
++    const configured = await readUserConfiguredPiProviders().catch(() => [] as string[]);
++    const configuredListed = listed.find((provider) => configured.includes(provider));
++    return configuredListed ?? listed[0];
++  }
++
++  async getCurrentActiveModel(_sessionId?: string): Promise<ProviderCurrentActiveModel> {
++    // Phase 1: pi's per-session model lives in the JSONL transcript, which the
++    // sessions facet already surfaces; the registry keeps answering with the
++    // curated default instead of reading runtime state.
++    return buildDefaultProviderCurrentActiveModel(PI_PREDEFINED_MODELS);
++  }
++}
+diff --git a/server/modules/providers/list/pi/pi-runtime.provider.test.ts b/server/modules/providers/list/pi/pi-runtime.provider.test.ts
+new file mode 100644
+index 00000000..c2bcceb4
+--- /dev/null
++++ b/server/modules/providers/list/pi/pi-runtime.provider.test.ts
+@@ -0,0 +1,613 @@
++import assert from 'node:assert/strict';
++import { existsSync } from 'node:fs';
++import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import test from 'node:test';
++
++import type { NormalizedMessage, ProviderRuntimeContext, ProviderRuntimeWriter } from '@/shared/types.js';
++import { AppError } from '@/shared/utils.js';
++
++import {
++  abortPiSession,
++  activePiProcessesForTest,
++  buildPiArgs,
++  isPiSessionActive,
++  piRuntime,
++  processPiOutputLine,
++  releasePiProcessForTest,
++  type PiProcessHandle,
++} from './pi-runtime.provider.js';
++import { mapPiEventToMessages } from './pi-sessions.provider.js';
++
++const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
++
++// The runtime contract only cares that normalizeMessage maps one raw pi event
++// onto zero or more normalized messages, so the context wires the sessions
++// facet's real mapping — the same one the live provider registry serves.
++const makeRuntimeContext = (overrides: Partial<ProviderRuntimeContext> = {}): ProviderRuntimeContext => ({
++  resolveProviderSessionId: (sessionId) => sessionId || null,
++  resolveResumeModel: async (_sessionId, requestedModel) => requestedModel || undefined,
++  getProviderModels: async () => ({ OPTIONS: [], DEFAULT: '' }),
++  normalizeMessage: (raw, sessionId) => mapPiEventToMessages(raw, sessionId),
++  isProviderInstalled: async () => true,
++  ...overrides,
++});
++
++// Fake event stream copied from a recorded `pi -p --mode json` transcript
++// (pi 0.85.1). Field shapes are the protocol facts that both the runtime and
++// the sessions normalizer build on.
++const FAKE_SESSION_ID = '0198c0de-7a5b-7f3e-9a1c-3d2e4f5a6b7c';
++const FINAL_USAGE = {
++  input: 1474,
++  output: 18,
++  cacheRead: 128,
++  cacheWrite: 0,
++  totalTokens: 1620,
++  cost: { input: 0.001, output: 0.002, total: 0.003 },
++};
++const FAKE_EVENTS = [
++  {
++    type: 'session',
++    version: 3,
++    id: FAKE_SESSION_ID,
++    timestamp: '2026-09-12T13:52:05.003Z',
++    cwd: process.cwd(),
++  },
++  { type: 'agent_start' },
++  { type: 'turn_start' },
++  {
++    type: 'message_start',
++    message: { role: 'user', content: [{ type: 'text', text: 'Say hi' }] },
++  },
++  {
++    type: 'message_end',
++    message: { role: 'user', content: [{ type: 'text', text: 'Say hi' }] },
++  },
++  {
++    type: 'message_start',
++    message: {
++      role: 'assistant',
++      content: [{ type: 'text', text: '', stopReason: 'pending' }],
++    },
++  },
++  {
++    type: 'message_update',
++    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
++    assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'Hello' },
++  },
++  {
++    type: 'message_update',
++    usage: FINAL_USAGE,
++    assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: ' world' },
++  },
++  {
++    type: 'message_end',
++    message: {
++      role: 'assistant',
++      content: [{ type: 'text', text: 'Hello world' }],
++      stopReason: 'stop',
++      usage: FINAL_USAGE,
++    },
++  },
++  { type: 'turn_end' },
++  { type: 'agent_end', messages: [] },
++  { type: 'agent_settled' },
++];
++
++const findEnvKey = (name: string): string =>
++  Object.keys(process.env).find((key) => key.toLowerCase() === name.toLowerCase()) || name;
++
++async function writeFakePi(binDir: string, { mode = 'replay' }: { mode?: string } = {}): Promise<void> {
++  const scriptPath = path.join(binDir, 'pi.js');
++  await writeFile(scriptPath, `
++const fs = require('node:fs');
++const capturePath = process.env.PI_ARGS_CAPTURE;
++const args = process.argv.slice(2);
++if (capturePath) {
++  fs.writeFileSync(capturePath, JSON.stringify(args));
++}
++
++// Resume runs keep the same session id, so the fake echoes the requested
++// --session value back in the header; new runs mint a fixed one.
++const sessionFlagIndex = args.indexOf('--session');
++const headerId = sessionFlagIndex >= 0 ? args[sessionFlagIndex + 1] : ${JSON.stringify(FAKE_SESSION_ID)};
++const header = JSON.stringify({
++  type: 'session',
++  version: 3,
++  id: headerId,
++  timestamp: '2026-09-12T13:52:05.003Z',
++  cwd: process.cwd(),
++});
++
++const mode = process.env.PI_EVENT_MODE || '${mode}';
++if (mode === 'hang') {
++  console.log(header);
++  // Long-running turn: no further output, process stays alive until killed.
++  setTimeout(() => {}, 30_000);
++} else if (mode === 'garbage') {
++  console.log('pi: warning: partially written line');
++} else if (mode === 'utf8-split') {
++  // A multi-byte character straddling two stdout chunks: chunk-local decoding
++  // renders U+FFFD, a streaming decoder reassembles it.
++  const line = JSON.stringify({
++    type: 'message_update',
++    usage: ${JSON.stringify(FINAL_USAGE)},
++    assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: '你好世界' },
++  });
++  const bytes = Buffer.from(line + '\\n', 'utf8');
++  const splitAt = bytes.indexOf(Buffer.from('你', 'utf8')) + 1;
++  process.stdout.write(bytes.subarray(0, splitAt));
++  setTimeout(() => {
++    process.stdout.write(bytes.subarray(splitAt));
++  }, 20);
++} else if (mode === 'model-error') {
++  // pi exits 0 even when the model call failed; the error only shows up as
++  // stopReason/errorMessage on the assistant message (verified against
++  // pi 0.85.1).
++  console.log(header);
++  console.log(JSON.stringify({ type: 'agent_start' }));
++  console.log(JSON.stringify({
++    type: 'message_start',
++    message: { role: 'assistant', content: [{ type: 'text', text: '', stopReason: 'pending' }] },
++  }));
++  console.log(JSON.stringify({
++    type: 'message_end',
++    message: { role: 'assistant', content: [{ type: 'text', text: '' }], stopReason: 'error', errorMessage: '403 {"error":"forbidden"}' },
++  }));
++  console.log(JSON.stringify({ type: 'agent_end', messages: [], willRetry: false }));
++  console.log(JSON.stringify({ type: 'agent_settled' }));
++} else {
++  const events = ${JSON.stringify(FAKE_EVENTS)}.map((event) => JSON.stringify(event));
++  console.log([header].concat(events.slice(1)).join('\\n'));
++}
++`, 'utf8');
++
++  if (process.platform === 'win32') {
++    const commandPath = path.join(binDir, 'pi.cmd');
++    await writeFile(commandPath, '@echo off\r\nnode "%~dp0pi.js" %*\r\n', 'utf8');
++    return;
++  }
++
++  const commandPath = path.join(binDir, 'pi');
++  await writeFile(commandPath, '#!/bin/sh\nnode "$(dirname "$0")/pi.js" "$@"\n', 'utf8');
++  await chmod(commandPath, 0o755);
++}
++
++function createWriter(
++  messages: NormalizedMessage[],
++): ProviderRuntimeWriter & { setSessionIdCalls: number; sessionId: string | null } {
++  const writer: ProviderRuntimeWriter & { setSessionIdCalls: number; sessionId: string | null } = {
++    userId: null,
++    sessionId: null,
++    setSessionIdCalls: 0,
++    send(message: NormalizedMessage) {
++      messages.push(message);
++    },
++    setSessionId(sessionId: string) {
++      this.setSessionIdCalls += 1;
++      this.sessionId = sessionId;
++    },
++  };
++  return writer;
++}
++
++/** Removes a temp tree, retrying while Windows releases a just-killed child's handles. */
++async function rmWithRetry(dir: string, attempts = 20): Promise<void> {
++  for (let attempt = 0; attempt < attempts; attempt += 1) {
++    try {
++      await rm(dir, { recursive: true, force: true });
++      return;
++    } catch (error) {
++      if (attempt === attempts - 1) {
++        // Cleanup of a temp dir must not fail the assertion it followed.
++        return;
++      }
++      await sleep(100);
++    }
++  }
++}
++
++async function withFakePiOnPath(mode: string, fn: (tempRoot: string) => Promise<void>): Promise<void> {  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'pi-cli-'));
++  const pathKey = findEnvKey('PATH');
++  const pathExtKey = findEnvKey('PATHEXT');
++  const previousPath = process.env[pathKey];
++  const previousPathExt = process.env[pathExtKey];
++  const previousArgsCapture = process.env.PI_ARGS_CAPTURE;
++  const previousMode = process.env.PI_EVENT_MODE;
++
++  try {
++    if (mode !== 'missing') {
++      await writeFakePi(tempRoot, { mode });
++    }
++    // "missing" swaps PATH for an empty dir: prepending would still resolve a
++    // real `pi` installed further down PATH, and the ENOENT contract needs the
++    // lookup to actually fail.
++    process.env[pathKey] = mode === 'missing'
++      ? tempRoot
++      : `${tempRoot}${path.delimiter}${previousPath || ''}`;
++    process.env.PI_EVENT_MODE = mode;
++    if (process.platform === 'win32') {
++      process.env[pathExtKey] = previousPathExt?.toUpperCase().includes('.CMD')
++        ? previousPathExt
++        : `.COM;.EXE;.BAT;.CMD${previousPathExt ? `;${previousPathExt}` : ''}`;
++    }
++    return await fn(tempRoot);
++  } finally {
++    if (previousPath === undefined) {
++      delete process.env[pathKey];
++    } else {
++      process.env[pathKey] = previousPath;
++    }
++
++    if (previousPathExt === undefined) {
++      delete process.env[pathExtKey];
++    } else {
++      process.env[pathExtKey] = previousPathExt;
++    }
++
++    if (previousArgsCapture === undefined) {
++      delete process.env.PI_ARGS_CAPTURE;
++    } else {
++      process.env.PI_ARGS_CAPTURE = previousArgsCapture;
++    }
++
++    if (previousMode === undefined) {
++      delete process.env.PI_EVENT_MODE;
++    } else {
++      process.env.PI_EVENT_MODE = previousMode;
++    }
++
++    // A just-killed child can still hold its cwd on Windows for a moment, so a
++    // single immediate rm races the OS handle release.
++    await rmWithRetry(tempRoot);
++  }
++}
++
++test('buildPiArgs maps options onto the pi print/json invocation', () => {
++  assert.deepEqual(
++    buildPiArgs({ providerSessionId: 'abc', model: 'anthropic/claude-sonnet-4', prompt: 'hi' }),
++    ['-p', '--mode', 'json', '--session', 'abc', '--model', 'anthropic/claude-sonnet-4', '--', 'hi'],
++  );
++  assert.deepEqual(buildPiArgs({ prompt: 'hi' }), ['-p', '--mode', 'json', '--', 'hi']);
++  // A prompt that begins with '-' stays positional behind the `--` guard.
++  assert.deepEqual(
++    buildPiArgs({ prompt: '--dangerous-looking prompt' }),
++    ['-p', '--mode', 'json', '--', '--dangerous-looking prompt'],
++  );
++  // Attachment-only runs send no positional prompt at all.
++  assert.deepEqual(buildPiArgs({}), ['-p', '--mode', 'json']);
++});
++
++test('spawnPi emits session_created, stream deltas and exactly one terminal complete', async () => {
++  const messages: NormalizedMessage[] = [];
++  let argsCapturePath = '';
++  await withFakePiOnPath('replay', async (tempRoot) => {
++    argsCapturePath = path.join(tempRoot, 'pi-args.json');
++    process.env.PI_ARGS_CAPTURE = argsCapturePath;
++    const writer = createWriter(messages);
++    // pi has no permission system: permissionMode/effort must be ignored.
++    await piRuntime.run(
++      'Say hi',
++      {
++        sessionId: 'app-1',
++        cwd: tempRoot,
++        // Spread on purpose: pi has no permission/effort levers, so unknown
++        // pass-through options must be ignored, not type-error the caller.
++        ...({ permissionMode: 'bypassPermissions', effort: 'high' } as Record<string, unknown>),
++      },
++      writer,
++      makeRuntimeContext({ resolveProviderSessionId: () => null }),
++    );
++
++    const kinds = messages.map((message) => message.kind);
++    const complete = messages.find((message) => message.kind === 'complete');
++
++    assert.equal(messages[0].kind, 'session_created');
++    assert.equal(messages[0].newSessionId, FAKE_SESSION_ID);
++    assert.equal(writer.setSessionIdCalls, 1);
++    assert.equal(writer.sessionId, FAKE_SESSION_ID);
++
++    const sessionCreatedIndex = kinds.indexOf('session_created');
++    const firstDeltaIndex = kinds.indexOf('stream_delta');
++    assert.ok(firstDeltaIndex > sessionCreatedIndex);
++    assert.deepEqual(
++      messages.filter((message) => message.kind === 'stream_delta').map((message) => message.content),
++      ['Hello', ' world'],
++    );
++
++    // Exactly one terminal complete, and it closes the run.
++    assert.equal(kinds.filter((kind) => kind === 'complete').length, 1);
++    const lastMessage = messages.at(-1);
++    assert.ok(lastMessage);
++    assert.equal(lastMessage.kind, 'complete');
++    assert.equal(complete?.success, true);
++    assert.equal(complete?.aborted, false);
++    assert.equal(complete?.actualSessionId, FAKE_SESSION_ID);
++    assert.equal(messages.some((message) => message.kind === 'error'), false);
++
++    // Last recorded usage (from message_update) feeds the token budget before complete.
++    const tokenBudgetIndex = kinds.indexOf('status');
++    assert.ok(tokenBudgetIndex > -1 && tokenBudgetIndex < kinds.indexOf('complete'));
++    const tokenBudgetMessage = messages[tokenBudgetIndex];
++    assert.equal(tokenBudgetMessage.text, 'token_budget');
++    const budget = tokenBudgetMessage.tokenBudget as {
++      used: number;
++      inputTokens: number;
++      outputTokens: number;
++      cost?: number;
++    };
++    assert.equal(budget.used, FINAL_USAGE.totalTokens);
++    assert.equal(budget.inputTokens, FINAL_USAGE.input + FINAL_USAGE.cacheRead);
++    assert.equal(budget.outputTokens, FINAL_USAGE.output);
++    assert.equal(budget.cost, FINAL_USAGE.cost.total);
++
++    const launchedArgs = JSON.parse(await readFile(argsCapturePath, 'utf8')) as string[];
++    assert.deepEqual(launchedArgs.slice(0, 3), ['-p', '--mode', 'json']);
++    // pi has no --dir flag; the working directory is the spawn cwd option.
++    assert.equal(launchedArgs.includes('--dir'), false);
++    // pi has no permission/effort levers: those options map to no flag at all.
++    assert.equal(launchedArgs.includes('--auto'), false);
++    assert.equal(launchedArgs.includes('--agent'), false);
++    assert.equal(launchedArgs.includes('--variant'), false);
++    // The prompt rides behind `--` and stays the final positional argument.
++    const promptGuardIndex = launchedArgs.indexOf('--');
++    assert.ok(promptGuardIndex > -1);
++    assert.equal(launchedArgs.at(-1), 'Say hi');
++  });
++});
++
++test('spawnPi resumes with --session and does not re-announce an existing session', async () => {
++  const messages: NormalizedMessage[] = [];
++  await withFakePiOnPath('replay', async (tempRoot) => {
++    const argsCapturePath = path.join(tempRoot, 'pi-resume-args.json');
++    process.env.PI_ARGS_CAPTURE = argsCapturePath;
++    const writer = createWriter(messages);
++
++    await piRuntime.run(
++      'Continue',
++      { sessionId: 'app-1', cwd: tempRoot },
++      writer,
++      makeRuntimeContext({ resolveProviderSessionId: () => 'existing-session' }),
++    );
++
++    assert.equal(messages.some((message) => message.kind === 'session_created'), false);
++    assert.equal(writer.setSessionIdCalls, 0);
++    assert.equal(messages.filter((message) => message.kind === 'complete').length, 1);
++
++    const launchedArgs = JSON.parse(await readFile(argsCapturePath, 'utf8')) as string[];
++    const sessionIndex = launchedArgs.indexOf('--session');
++    assert.ok(sessionIndex > -1);
++    assert.equal(launchedArgs[sessionIndex + 1], 'existing-session');
++  });
++});
++
++test('spawnPi resolves successfully when the model errored but pi exited 0', async () => {
++  const messages: NormalizedMessage[] = [];
++  await withFakePiOnPath('model-error', async (tempRoot) => {
++    const writer = createWriter(messages);
++    await piRuntime.run('Say hi', { sessionId: 'app-1', cwd: tempRoot }, writer, makeRuntimeContext());
++
++    // Exit code 0 is not success evidence for pi, but the runtime treats the
++    // process lifecycle only; error mapping belongs to normalizeMessage.
++    assert.equal(messages.filter((message) => message.kind === 'complete').length, 1);
++    const lastMessage = messages.at(-1);
++    assert.ok(lastMessage);
++    assert.equal(lastMessage.kind, 'complete');
++    assert.equal(lastMessage.success, true);
++  });
++});
++
++test('processPiOutputLine forwards non-JSON lines as stream deltas', () => {
++  const messages: NormalizedMessage[] = [];
++  const writer = createWriter(messages);
++  processPiOutputLine('pi: warning: partially written line', {
++    ws: writer,
++    sessionId: 'app-1',
++    getCapturedSessionId: () => null,
++    registerSession: () => {},
++    setUsage: () => {},
++    normalizeMessage: mapPiEventToMessages,
++  });
++
++  assert.equal(messages.length, 1);
++  assert.equal(messages[0].kind, 'stream_delta');
++  assert.equal(messages[0].content, 'pi: warning: partially written line');
++  assert.equal(messages[0].sessionId, 'app-1');
++});
++
++test('spawnPi keeps stdout non-JSON lines streaming and still completes once', async () => {
++  const messages: NormalizedMessage[] = [];
++  await withFakePiOnPath('garbage', async (tempRoot) => {
++    const writer = createWriter(messages);
++    await piRuntime.run('Say hi', { sessionId: 'app-1', cwd: tempRoot }, writer, makeRuntimeContext());
++
++    assert.deepEqual(
++      messages.filter((message) => message.kind === 'stream_delta').map((message) => message.content),
++      ['pi: warning: partially written line'],
++    );
++    assert.equal(messages.filter((message) => message.kind === 'complete').length, 1);
++  });
++});
++
++test('spawnPi decodes multi-byte characters that span stdout chunks', async () => {
++  const messages: NormalizedMessage[] = [];
++  await withFakePiOnPath('utf8-split', async (tempRoot) => {
++    const writer = createWriter(messages);
++    await piRuntime.run('Say hi', { sessionId: 'app-utf8', cwd: tempRoot }, writer, makeRuntimeContext());
++
++    // The delta arrives as one intact text run — not as a mangled JSON line
++    // routed through the non-JSON fallback.
++    assert.deepEqual(
++      messages.filter((message) => message.kind === 'stream_delta').map((message) => message.content),
++      ['你好世界'],
++    );
++    assert.equal(JSON.stringify(messages).includes('\uFFFD'), false);
++    assert.equal(messages.filter((message) => message.kind === 'complete').length, 1);
++  });
++});
++
++test('abort during model resolution prevents the spawn entirely', async () => {
++  const messages: NormalizedMessage[] = [];
++  await withFakePiOnPath('replay', async (tempRoot) => {
++    const argsCapturePath = path.join(tempRoot, 'pi-abort-resolve-args.json');
++    process.env.PI_ARGS_CAPTURE = argsCapturePath;
++    const writer = createWriter(messages);
++
++    let releaseModelResolution!: () => void;
++    const modelResolutionGate = new Promise<void>((release) => {
++      releaseModelResolution = release;
++    });
++    const runPromise = piRuntime.run('Say hi', { sessionId: 'app-abort-resolve', cwd: tempRoot }, writer, makeRuntimeContext({
++      resolveResumeModel: async () => {
++        await modelResolutionGate;
++        return undefined;
++      },
++    }));
++    let rejection: unknown = null;
++    runPromise.catch((error) => {
++      rejection = error;
++    });
++
++    // The run is reachable while its model is still resolving — this is the
++    // window that used to report "not running" and then spawn anyway.
++    assert.equal(isPiSessionActive('app-abort-resolve'), true);
++    assert.equal(abortPiSession('app-abort-resolve'), true);
++    assert.equal(abortPiSession('app-abort-resolve'), false);
++
++    releaseModelResolution();
++    // Resolves (the gateway owns the aborted run's terminal complete) instead
++    // of rejecting.
++    await runPromise;
++
++    // No child was ever launched: the fake pi's argv capture never appeared.
++    assert.equal(existsSync(argsCapturePath), false);
++    // The aborted run sends nothing itself.
++    assert.equal(messages.length, 0);
++    assert.equal(rejection, null);
++    assert.equal(isPiSessionActive('app-abort-resolve'), false);
++  });
++});
++
++test('a resolver failure after abort settles the run instead of rejecting', async () => {
++  const messages: NormalizedMessage[] = [];
++  await withFakePiOnPath('replay', async (tempRoot) => {
++    const argsCapturePath = path.join(tempRoot, 'pi-abort-resolver-error-args.json');
++    process.env.PI_ARGS_CAPTURE = argsCapturePath;
++    const writer = createWriter(messages);
++
++    const resolverError = new Error('model lookup failed');
++    let failModelResolution!: (error: unknown) => void;
++    const modelResolutionGate = new Promise<never>((_resolve, reject) => {
++      failModelResolution = reject;
++    });
++    const runPromise = piRuntime.run('Say hi', { sessionId: 'app-abort-resolver-error', cwd: tempRoot }, writer, makeRuntimeContext({
++      resolveResumeModel: async () => {
++        await modelResolutionGate;
++        return undefined;
++      },
++    }));
++    let rejection: unknown = null;
++    runPromise.catch((error) => {
++      rejection = error;
++    });
++
++    // Abort lands while the model is still resolving — the gateway has already
++    // sent this run's terminal cancelled complete at that point.
++    assert.equal(isPiSessionActive('app-abort-resolver-error'), true);
++    assert.equal(abortPiSession('app-abort-resolver-error'), true);
++
++    // The resolver then fails; the cancelled run must still settle as success.
++    failModelResolution(resolverError);
++    await runPromise;
++
++    // No child was launched and the failure never surfaced anywhere.
++    assert.equal(existsSync(argsCapturePath), false);
++    assert.equal(messages.length, 0);
++    assert.equal(rejection, null);
++    assert.equal(isPiSessionActive('app-abort-resolver-error'), false);
++  });
++});
++
++test('abortPiSession kills the run, suppresses the runtime complete and rejects once', async () => {
++  const messages: NormalizedMessage[] = [];
++  await withFakePiOnPath('hang', async (tempRoot) => {
++    const argsCapturePath = path.join(tempRoot, 'pi-abort-args.json');
++    process.env.PI_ARGS_CAPTURE = argsCapturePath;
++    const writer = createWriter(messages);
++    const runPromise = piRuntime.run('Say hi', { sessionId: 'app-abort', cwd: tempRoot }, writer, makeRuntimeContext());
++    // The gateway rejects the run promise too; swallow it until assert.rejects.
++    let rejection: unknown = null;
++    runPromise.catch((error) => {
++      rejection = error;
++    });
++
++    // Poll until the child actually spawned (the fake writes its argv at
++    // startup) and then abort. Aborting earlier would land on the pre-spawn
++    // pending entry — that window has its own contract, covered above.
++    for (let attempt = 0; attempt < 100 && !existsSync(argsCapturePath); attempt += 1) {
++      await sleep(50);
++    }
++    assert.equal(existsSync(argsCapturePath), true);
++    assert.equal(abortPiSession('app-abort'), true);
++    // A second abort finds nothing running.
++    assert.equal(abortPiSession('app-abort'), false);
++
++    await assert.rejects(runPromise, /terminated|exited with code/);
++    assert.ok(rejection instanceof Error);
++
++    // The gateway (`chatRunRegistry.completeRun`) owns the single aborted
++    // `complete` for cancelled runs; the runtime itself must stay silent here
++    // or clients would see the run finish twice.
++    assert.equal(messages.some((message) => message.kind === 'complete'), false);
++  });
++});
++
++test('spawnPi rejects PROVIDER_NOT_INSTALLED when the CLI is missing', async () => {
++  const messages: NormalizedMessage[] = [];
++  await withFakePiOnPath('missing', async (tempRoot) => {
++    const writer = createWriter(messages);
++    await assert.rejects(
++      piRuntime.run('Say hi', { sessionId: 'app-1', cwd: tempRoot }, writer, makeRuntimeContext({
++        isProviderInstalled: async () => false,
++      })),
++      (error) => {
++        assert.ok(error instanceof AppError);
++        assert.equal(error.code, 'PROVIDER_NOT_INSTALLED');
++        assert.match(error.message, /Pi CLI is not installed/);
++        return true;
++      },
++    );
++
++    assert.equal(messages.filter((message) => message.kind === 'error').length, 1);
++    const completes = messages.filter((message) => message.kind === 'complete');
++    assert.equal(completes.length, 1);
++    assert.equal(completes[0].success, false);
++  });
++});
++
++test('a finishing run releases only the process-table entries it still owns', () => {
++  // Stop then immediately send again: the aborted child's `close` arrives after
++  // a replacement run is already registered under the same session key.
++  // Deleting by key alone would evict that replacement, leaving its pi process
++  // unstoppable by `abort`. releasePiProcess is the invariant that prevents it.
++  const first = { aborted: false } as PiProcessHandle;
++  const second = { aborted: false } as PiProcessHandle;
++
++  activePiProcessesForTest.set('app', first);
++  activePiProcessesForTest.set('native-1', first);
++
++  // The replacement takes over both keys before the old child closes.
++  activePiProcessesForTest.set('app', second);
++  activePiProcessesForTest.set('native-1', second);
++
++  releasePiProcessForTest('app', first);
++  releasePiProcessForTest('native-1', first);
++
++  assert.equal(activePiProcessesForTest.get('app'), second, 'the replacement must survive the old close');
++  assert.equal(activePiProcessesForTest.get('native-1'), second);
++
++  // The replacement's own close does clear them.
++  releasePiProcessForTest('app', second);
++  assert.equal(activePiProcessesForTest.has('app'), false);
++});
+diff --git a/server/modules/providers/list/pi/pi-runtime.provider.ts b/server/modules/providers/list/pi/pi-runtime.provider.ts
+new file mode 100644
+index 00000000..7896ece9
+--- /dev/null
++++ b/server/modules/providers/list/pi/pi-runtime.provider.ts
+@@ -0,0 +1,714 @@
++import type { ChildProcess } from 'node:child_process';
++import { StringDecoder } from 'node:string_decoder';
++
++import crossSpawn from 'cross-spawn';
++
++import {
++  appendFilesInputTag,
++  appendImagesInputTag,
++  normalizeAttachmentDescriptors,
++} from '@/shared/image-attachments.js';
++import { notifyRunFailed, notifyRunStopped } from '@/modules/notifications/index.js';
++import type { NormalizedMessage, ProviderRuntimeContext, ProviderRuntimeWriter } from '@/shared/types.js';
++import { AppError, createCompleteMessage, createNormalizedMessage, flattenPromptForWindowsShell } from '@/shared/utils.js';
++
++// cross-spawn resolves .cmd shims/PATHEXT on Windows and delegates to
++// child_process.spawn everywhere else.
++const spawnFunction = crossSpawn;
++
++/** Handle registered in the process table, carrying the run's session key. */
++export type PiProcessHandle = ChildProcess & { sessionId?: string; aborted?: boolean };
++
++/**
++ * Process-table entry for the window before the child exists (the resume model
++ * is still resolving). It only carries the `aborted` flag: an abort that lands
++ * there flags and removes it, and the spawn path checks the flag afterwards —
++ * without it, `abort` would report "not running" and the run would go on to
++ * spawn pi after the gateway had already closed it.
++ */
++function createPendingEntry(): PiProcessHandle {
++  return Object.assign({} as ChildProcess, { aborted: false });
++}
++
++/**
++ * Options the pi runtime reads from one run call.
++ *
++ * `permissionMode` and `effort` are deliberately absent: pi has no permission
++ * system and no reasoning-effort lever (see the pi capabilities), so neither
++ * option maps to any CLI flag or env var.
++ */
++type PiRunOptions = {
++  sessionId?: string | null;
++  projectPath?: string;
++  cwd?: string;
++  model?: string | null;
++  sessionSummary?: string;
++  images?: unknown;
++  files?: unknown;
++};
++
++/** Cumulative per-run usage counters pi attaches to every JSON event. */
++type PiUsageCounters = {
++  input?: number;
++  output?: number;
++  cacheRead?: number;
++  totalTokens?: number;
++  cost?: { total?: number };
++};
++
++/** Mutable per-run state bag threaded through `processPiOutputLine`. */
++type PiOutputContext = {
++  ws: ProviderRuntimeWriter;
++  sessionId?: string | null;
++  getCapturedSessionId(): string | null;
++  registerSession(nextSessionId: string): void;
++  setUsage(usage: PiUsageCounters): void;
++  normalizeMessage(raw: unknown, sessionId: string | null): NormalizedMessage[];
++};
++
++const activePiProcesses = new Map<string, PiProcessHandle>();
++
++/**
++ * How long to keep waiting for stdio after pi itself has exited.
++ *
++ * `close` also waits for the pipes, which a background process pi started can
++ * hold open indefinitely. This window lets the normal flush land first and only
++ * then finalizes on the weaker `exit` signal.
++ */
++const PI_EXIT_GRACE_MS = 2000;
++
++/**
++ * Removes a process-table entry only when it is still the caller's own.
++ *
++ * A run's `close`/`error` fires asynchronously after the run was aborted, and
++ * by then the same session may already have a new run registered under the
++ * same key — `abort` drops the entry immediately, so the next send can start
++ * a replacement before the old child's `close` arrives. Deleting by key alone
++ * would remove that replacement, leaving the new pi process unreachable by
++ * `abort` while it keeps running and streaming. Keying the delete on the
++ * handle makes an exiting run clean up only after itself.
++ */
++function releasePiProcess(key: string, handle: PiProcessHandle): void {
++  if (activePiProcesses.get(key) === handle) {
++    activePiProcesses.delete(key);
++  }
++}
++
++/**
++ * Builds the `pi -p --mode json` argument vector for one run.
++ *
++ * Verified against pi 0.85.1:
++ * - the prompt is the final positional argument, preceded by `--` so a prompt
++ *   that begins with `-` is never parsed as an option (pi treats everything
++ *   after `--` as positional messages);
++ * - `--session` resumes a provider session with its full uuid (resumed runs
++ *   keep the same session id and append to the same session file);
++ * - `--model` accepts a bare model id or a `provider/model` pair;
++ * - there is no `--dir`/`--cwd` flag — the working directory is the spawn
++ *   `cwd` option.
++ *
++ * Exported for tests only.
++ */
++export function buildPiArgs({
++  providerSessionId,
++  model,
++  prompt,
++}: {
++  providerSessionId?: string | null;
++  model?: string | null;
++  prompt?: string | null;
++}): string[] {
++  const args = ['-p', '--mode', 'json'];
++  if (providerSessionId) {
++    args.push('--session', providerSessionId);
++  }
++  if (model) {
++    args.push('--model', model);
++  }
++  if (prompt && prompt.trim()) {
++    args.push('--', flattenPromptForWindowsShell(prompt));
++  }
++  return args;
++}
++
++/**
++ * Reads the provider-native session id out of one parsed stdout event.
++ *
++ * Only the `session` header carries an id; the streaming events reference
++ * messages and tool calls, never the session.
++ */
++function readPiSessionId(event: unknown): string | null {
++  if (!event || typeof event !== 'object') {
++    return null;
++  }
++
++  const candidate = event as { type?: unknown; id?: unknown };
++  return candidate.type === 'session' && typeof candidate.id === 'string' ? candidate.id : null;
++}
++
++/**
++ * Maps pi's cumulative usage counters onto the token-budget shape the chat
++ * composer reads (`inputTokens`/`outputTokens`/`used`/`breakdown`, mirroring
++ * the opencode runtime), keeping pi's own totals and cost as extra fields.
++ *
++ * pi reports cache reads separately; like opencode, they count as input.
++ */
++function readPiTokenBudget(usage: PiUsageCounters | null): {
++  used: number;
++  inputTokens: number;
++  outputTokens: number;
++  breakdown: { input: number; output: number };
++  totalTokens: number;
++  cost?: number;
++} | null {
++  if (!usage || typeof usage !== 'object') {
++    return null;
++  }
++
++  const inputTokens = Number(usage.input || 0) + Number(usage.cacheRead || 0);
++  const outputTokens = Number(usage.output || 0);
++  const used = Number(usage.totalTokens || 0) || inputTokens + outputTokens;
++  if (used <= 0) {
++    return null;
++  }
++
++  return {
++    used,
++    inputTokens,
++    outputTokens,
++    breakdown: {
++      input: inputTokens,
++      output: outputTokens,
++    },
++    totalTokens: Number(usage.totalTokens || 0),
++    cost: usage.cost && typeof usage.cost === 'object' ? usage.cost.total : undefined,
++  };
++}
++
++/**
++ * Parses one stdout line from `pi -p --mode json` and forwards what it yields.
++ *
++ * Exported for tests only; the runtime passes a ctx bag because the mutable
++ * state (captured session id, last usage) lives in the run closure.
++ *
++ * - Unparseable lines (pi's own warnings mixed into stdout) stream through as
++ *   deltas rather than killing the run.
++ * - The `session` header registers the provider-native id (contract: new
++ *   provider sessions announce `session_created` once, and the writer learns
++ *   the id before any content event).
++ * - Every event's top-level `usage` is cumulative, so the last one seen wins.
++ * - Event-to-message mapping is `context.normalizeMessage`; the runtime never
++ *   interprets event contents itself.
++ */
++export function processPiOutputLine(line: string, ctx: PiOutputContext): void {
++  if (!line || !line.trim()) {
++    return;
++  }
++
++  let event: unknown;
++  try {
++    event = JSON.parse(line);
++  } catch {
++    ctx.ws.send(createNormalizedMessage({
++      kind: 'stream_delta',
++      content: line,
++      sessionId: ctx.getCapturedSessionId() || ctx.sessionId || null,
++      provider: 'pi',
++    }));
++    return;
++  }
++
++  try {
++    const nextSessionId = readPiSessionId(event);
++    if (nextSessionId) {
++      ctx.registerSession(nextSessionId);
++    }
++    if (event && typeof event === 'object' && 'usage' in event) {
++      const usage = (event as { usage?: unknown }).usage;
++      if (usage && typeof usage === 'object') {
++        ctx.setUsage(usage as PiUsageCounters);
++      }
++    }
++    const normalized = ctx.normalizeMessage(event, ctx.getCapturedSessionId() || ctx.sessionId || null);
++    for (const msg of normalized) {
++      ctx.ws.send(msg);
++    }
++  } catch (error) {
++    const errorContent = error instanceof Error ? error.message : String(error);
++    console.error('[Pi] Failed to process JSON output:', errorContent);
++    ctx.ws.send(createNormalizedMessage({
++      kind: 'error',
++      content: errorContent,
++      sessionId: ctx.getCapturedSessionId() || ctx.sessionId || null,
++      provider: 'pi',
++    }));
++  }
++}
++
++async function spawnPi(
++  command: string,
++  options: PiRunOptions = {},
++  ws: ProviderRuntimeWriter,
++  context: ProviderRuntimeContext,
++): Promise<void> {
++  return new Promise((resolve, reject) => {
++    const {
++      sessionId,
++      projectPath,
++      cwd,
++      model,
++      sessionSummary,
++      images,
++      files,
++    } = options;
++    // Callers pass the stable app session id; the CLI resumes with the
++    // provider-native id recorded on the session row.
++    const providerSessionId = context.resolveProviderSessionId(sessionId);
++    const workingDir = cwd || projectPath || process.cwd();
++    // Process-map key: the app session id when the caller supplied one, so
++    // abort-by-app-id always works.
++    const processKey = sessionId || Date.now().toString();
++    let capturedSessionId = providerSessionId;
++    let sessionCreatedSent = false;
++    let lastUsage: PiUsageCounters | null = null;
++    let stdoutLineBuffer = '';
++    let terminalNotificationSent = false;
++    let piProcess: PiProcessHandle | null = null;
++    // Unified lifecycle contract: exactly one terminal `complete` per run
++    // (close and error handlers can both fire for spawn failures).
++    let completeSent = false;
++    // Decoders span chunk boundaries: stdout/stderr arrive in arbitrary Buffer
++    // chunks and a multi-byte character can straddle two of them, which a
++    // chunk-local `toString()` would render as U+FFFD.
++    const stdoutDecoder = new StringDecoder('utf8');
++    const stderrDecoder = new StringDecoder('utf8');
++
++    // Registered before the resume model resolves so abort can reach the run
++    // in that window (see createPendingEntry).
++    const pendingEntry = createPendingEntry();
++    activePiProcesses.set(processKey, pendingEntry);
++
++    const notifyTerminalState = ({ code = null, error = null }: { code?: number | null; error?: string | null } = {}): void => {
++      if (terminalNotificationSent) {
++        return;
++      }
++
++      terminalNotificationSent = true;
++      // Notifications are app-facing, so they carry the app session id.
++      const finalSessionId = sessionId || capturedSessionId || processKey;
++      // A run the user stopped is not a failure. SIGTERM kills the child, so
++      // `close` reports code null here; without this branch every manual stop
++      // would push a "run failed: Pi CLI exited with code null" notification
++      // (and report "completed" when pi happens to exit 0 on the signal).
++      if (piProcess?.aborted || pendingEntry.aborted) {
++        notifyRunStopped({
++          userId: ws?.userId || null,
++          provider: 'pi',
++          sessionId: finalSessionId,
++          sessionName: sessionSummary,
++          stopReason: 'aborted',
++        });
++        return;
++      }
++      if (code === 0 && !error) {
++        notifyRunStopped({
++          userId: ws?.userId || null,
++          provider: 'pi',
++          sessionId: finalSessionId,
++          sessionName: sessionSummary,
++          stopReason: 'completed',
++        });
++        return;
++      }
++
++      notifyRunFailed({
++        userId: ws?.userId || null,
++        provider: 'pi',
++        sessionId: finalSessionId,
++        sessionName: sessionSummary,
++        error: error || `Pi CLI exited with code ${code}`,
++      });
++    };
++
++    const registerSession = (nextSessionId: string): void => {
++      if (!nextSessionId || capturedSessionId === nextSessionId) {
++        return;
++      }
++
++      capturedSessionId = nextSessionId;
++      // Legacy/direct callers without an app session id re-key the process
++      // under the provider-native id once it is known.
++      if (!sessionId && processKey !== capturedSessionId && piProcess) {
++        activePiProcesses.delete(processKey);
++        activePiProcesses.set(capturedSessionId, piProcess);
++      }
++      if (piProcess) {
++        piProcess.sessionId = capturedSessionId;
++      }
++
++      if (ws.setSessionId && typeof ws.setSessionId === 'function') {
++        ws.setSessionId(capturedSessionId);
++      }
++
++      if (!providerSessionId && !sessionCreatedSent) {
++        sessionCreatedSent = true;
++        ws.send(createNormalizedMessage({
++          kind: 'session_created',
++          newSessionId: capturedSessionId,
++          sessionId: capturedSessionId,
++          provider: 'pi',
++        }));
++      }
++    };
++
++    const processCtx: PiOutputContext = {
++      ws,
++      sessionId,
++      getCapturedSessionId: () => capturedSessionId,
++      registerSession,
++      setUsage: (usage: PiUsageCounters) => {
++        lastUsage = usage;
++      },
++      normalizeMessage: (raw: unknown, normalizedSessionId: string | null) => context.normalizeMessage(raw, normalizedSessionId),
++    };
++
++    void context.resolveResumeModel(sessionId ?? undefined, model).then(async (resolvedModel) => {
++      // Aborted while the model was still resolving: the gateway already sent
++      // this run's terminal complete on the abort path, so spawn nothing and
++      // stay silent.
++      if (pendingEntry.aborted) {
++        resolve();
++        return;
++      }
++
++      const args = buildPiArgs({ providerSessionId, model: resolvedModel });
++      const hasAttachments =
++        normalizeAttachmentDescriptors(images).length > 0
++        || normalizeAttachmentDescriptors(files).length > 0;
++      if ((command && command.trim()) || hasAttachments) {
++        // Attachment paths ride along as <images_input>/<files_input> blocks
++        // appended to the prompt; the session history reader strips the tags
++        // back out. pi is a .cmd shim on Windows, so the whole argument must
++        // be newline-free or cmd.exe silently truncates it. The leading `--`
++        // keeps a prompt that starts with `-` positional.
++        const promptWithAttachments = appendFilesInputTag(
++          appendImagesInputTag(command?.trim() || '', images),
++          files,
++        );
++        args.push('--', flattenPromptForWindowsShell(promptWithAttachments));
++      }
++
++      piProcess = spawnFunction('pi', args, {
++        cwd: workingDir,
++        stdio: ['pipe', 'pipe', 'pipe'],
++        // pi has no permission levers, so unlike opencode there is no env
++        // override to merge here — the user's own pi config governs.
++        env: { ...process.env },
++      }) as PiProcessHandle;
++
++      activePiProcesses.set(processKey, piProcess);
++      piProcess.sessionId = processKey;
++      piProcess.stdin?.end();
++
++      // cross-spawn 在 ENOENT 时先发 `error`、随后仍发一次 `close(1)`。若不记下
++      // 已由 error 处理的失败，close 里的裸 Error 会抢走 reject，调用方就拿不到
++      // PROVIDER_NOT_INSTALLED。
++      let spawnFailed = false;
++      // Set once the run reached its terminal handling, so `exit`'s fallback
++      // and `close` cannot both finalize the same run.
++      let runFinalized = false;
++
++      piProcess.stdout?.on('data', (data: Buffer) => {
++        stdoutLineBuffer += stdoutDecoder.write(data);
++        const completeLines = stdoutLineBuffer.split(/\r?\n/);
++        stdoutLineBuffer = completeLines.pop() || '';
++
++        completeLines.forEach((line) => {
++          processPiOutputLine(line.trim(), processCtx);
++        });
++      });
++
++      // 未安装时 stderr 是 cmd.exe / shell 自己的「找不到命令」本地化文本，不是
++      // agent 的输出：真正的 PROVIDER_NOT_INSTALLED 由下面的退出路径上报。
++      let stderrMuted = false;
++      // The install check is not cheap: it probes the CLI synchronously (a
++      // blocking spawn) and then asks every configured provider for its
++      // credentials. Asking once per stderr chunk would run that probe
++      // concurrently for every warning pi writes, stalling the event loop while
++      // a run is streaming. One verdict per run is enough — whether the CLI
++      // exists cannot change mid-run.
++      let installVerdict: Promise<boolean> | null = null;
++      const isInstalledOnce = (): Promise<boolean> => {
++        installVerdict ??= context.isProviderInstalled().catch(() => true);
++        return installVerdict;
++      };
++
++      piProcess.stderr?.on('data', (data: Buffer) => {
++        const stderrText = stderrDecoder.write(data);
++        if (!stderrText.trim() || stderrMuted) {
++          return;
++        }
++
++        void isInstalledOnce().then((installed) => {
++          if (!installed) {
++            stderrMuted = true;
++            return;
++          }
++          ws.send(createNormalizedMessage({
++            kind: 'error',
++            content: stderrText,
++            sessionId: capturedSessionId || sessionId || null,
++            provider: 'pi',
++          }));
++        });
++      });
++
++      // `close` waits for stdio to drain as well, and pi is an agent: a
++      // background process it started (a `cmd &`, a long-lived tool) inherits
++      // the pipes, so `close` may never fire even after pi itself is gone. The
++      // run would then stay unresolved, the session listed as running forever,
++      // and its process-table entry never released. `exit` fires as soon as the
++      // process itself ends, so it starts a short grace period after which the
++      // same finalizer runs with whatever stdio arrived by then.
++      let exitGrace: NodeJS.Timeout | null = null;
++      piProcess.on('exit', (code: number | null) => {
++        if (spawnFailed) {
++          return;
++        }
++        // An aborted run is already finished as far as the app is concerned —
++        // the gateway sent its terminal `complete`. Waiting out the grace
++        // period would only delay releasing this run.
++        if (piProcess?.aborted) {
++          void finishRun(code);
++          return;
++        }
++        exitGrace ??= setTimeout(() => {
++          finishRun(code);
++        }, PI_EXIT_GRACE_MS);
++      });
++
++      piProcess.on('close', async (code: number | null) => {
++        if (spawnFailed) {
++          // 该进程从未真正启动，失败已由 error handler 上报并 reject。
++          return;
++        }
++        if (exitGrace) {
++          // `close` arrived inside the grace window: it carries the flushed
++          // output, so its code wins and the fallback finalizer must not run.
++          clearTimeout(exitGrace);
++          exitGrace = null;
++        }
++        await finishRun(code);
++      });
++
++      /** The single terminal path for a run whose child ended. */
++      async function finishRun(code: number | null): Promise<void> {
++        if (spawnFailed || runFinalized) {
++          return;
++        }
++        runFinalized = true;
++        // 监听器里 piProcess 必然是本次 spawn 的实例（唯一为 null 的窗口是 spawn
++        // 前，那时还没有监听器）。
++        const self = piProcess;
++        if (!self) {
++          return;
++        }
++        // EventEmitter 不观察监听器返回的 Promise：这里的 await 之后仍在调
++        // ws.send / notifyTerminalState / isProviderInstalled，任何一处抛出都会让
++        // 下面的 resolve/reject 永远执行不到，run promise 悬空、会话卡在 running，
++        // 同时留下 unhandled rejection。兜底收尾，保证本轮一定 settle。
++        try {
++        const finalSessionId = sessionId || capturedSessionId || processKey;
++        // Only this run's own entries: a replacement run may already own these
++        // keys (see releasePiProcess).
++        releasePiProcess(finalSessionId, self);
++        releasePiProcess(processKey, self);
++
++        // 'close' fires after stdio flushed, so this is the moment to release
++        // whatever the decoder still held back before flushing the trailing
++        // (newline-less) line.
++        stdoutLineBuffer += stdoutDecoder.end();
++        if (stdoutLineBuffer.trim()) {
++          processPiOutputLine(stdoutLineBuffer.trim(), processCtx);
++          stdoutLineBuffer = '';
++        }
++
++        // pi reports cumulative usage on every event; the last one seen is
++        // the run's final accounting.
++        const tokenBudget = readPiTokenBudget(lastUsage);
++        if (tokenBudget) {
++          ws.send(createNormalizedMessage({
++            kind: 'status',
++            text: 'token_budget',
++            tokenBudget,
++            sessionId: finalSessionId,
++            provider: 'pi',
++          }));
++        }
++
++        // Windows 启动的是 `pi.cmd` 垫片：找不到时 cmd.exe 自己报「不是内部或外部
++        // 命令」并以 1 退出，走的是这里而不是 `error`。因此非 0 退出都要问一次安装
++        // 状态，未安装时报 PROVIDER_NOT_INSTALLED，与 ENOENT 分支保持一致。
++        // 判定必须在发 complete 之前：complete 是本轮运行的最后一条记录，之后再
++        // 追加任何消息都是「结束后的迟到事件」，UI 可能不渲染或渲染成孤立行。
++        let notInstalled = false;
++        if (code !== 0) {
++          notInstalled = !(await isInstalledOnce());
++          if (notInstalled) {
++            ws.send(createNormalizedMessage({
++              kind: 'error',
++              content: 'Pi CLI is not installed. Install it from https://pi.dev/',
++              sessionId: finalSessionId,
++              provider: 'pi',
++            }));
++          }
++        }
++
++        // Terminal complete — skipped for aborted runs (abort-session
++        // already sent the aborted complete on this run's behalf).
++        if (!completeSent && !piProcess?.aborted) {
++          completeSent = true;
++          ws.send(createCompleteMessage({
++            provider: 'pi',
++            sessionId: finalSessionId,
++            actualSessionId: capturedSessionId || null,
++            exitCode: code,
++          }));
++        }
++
++        if (code === 0) {
++          notifyTerminalState({ code });
++          resolve();
++          return;
++        }
++
++        if (notInstalled) {
++          notifyTerminalState({ code });
++          reject(new AppError('Pi CLI is not installed. Install it from https://pi.dev/', {
++            code: 'PROVIDER_NOT_INSTALLED',
++          }));
++          return;
++        }
++
++        notifyTerminalState({ code });
++        reject(new Error(code === null ? 'pi process was terminated' : `pi exited with code ${code}`));
++        } catch (error) {
++          // 收尾本身失败也要让本轮结束，否则会话永远停在「处理中」。
++          notifyTerminalState({ code, error: error instanceof Error ? error.message : 'pi run cleanup failed' });
++          reject(error);
++        }
++      }
++
++      piProcess.on('error', async (error: NodeJS.ErrnoException) => {
++        spawnFailed = true;
++        if (exitGrace) {
++          clearTimeout(exitGrace);
++          exitGrace = null;
++        }
++        const self = piProcess;
++        if (!self) {
++          return;
++        }
++        // Same contract as the close handler: an exception raised while
++        // reporting the failure must not leave this run unsettled.
++        try {
++        const finalSessionId = sessionId || capturedSessionId || processKey;
++        // Only this run's own entries: a replacement run may already own these
++        // keys (see releasePiProcess).
++        releasePiProcess(finalSessionId, self);
++        releasePiProcess(processKey, self);
++
++        const installed = await isInstalledOnce();
++        const notInstalled = error.code === 'ENOENT' && !installed;
++        const errorContent = !installed
++          ? 'Pi CLI is not installed. Install it from https://pi.dev/'
++          : error.message;
++
++        ws.send(createNormalizedMessage({
++          kind: 'error',
++          content: errorContent,
++          sessionId: finalSessionId,
++          provider: 'pi',
++        }));
++        if (!completeSent && !piProcess?.aborted) {
++          completeSent = true;
++          ws.send(createCompleteMessage({ provider: 'pi', sessionId: finalSessionId, exitCode: 1 }));
++        }
++        notifyTerminalState({ error: error.message });
++        if (notInstalled) {
++          reject(new AppError('Pi CLI is not installed. Install it from https://pi.dev/', {
++            code: 'PROVIDER_NOT_INSTALLED',
++          }));
++          return;
++        }
++        reject(error);
++        } catch (cleanupError) {
++          notifyTerminalState({ error: error.message });
++          reject(cleanupError);
++        }
++      });
++    }).catch((error: unknown) => {
++      // Model resolution failed before any child existed: drop the pending
++      // entry unless a real process (or an abort) already replaced it.
++      if (activePiProcesses.get(processKey) === pendingEntry) {
++        activePiProcesses.delete(processKey);
++      }
++      // An abort that landed while resolving already sent this run's terminal
++      // cancelled complete, so a resolver failure afterwards is not a run
++      // failure — settle silently like the aborted-resolve path above.
++      if (pendingEntry.aborted) {
++        resolve();
++        return;
++      }
++      reject(error);
++    });
++  });
++}
++
++function abortPiSession(sessionId: string): boolean {
++  const process = activePiProcesses.get(sessionId);
++  if (!process) {
++    return false;
++  }
++
++  // The abort handler sends the terminal complete (aborted: true); flag the
++  // process so its close handler does not emit a second one. A pending entry
++  // has no child to signal — flagging it is the whole contract, since the
++  // spawn path checks the flag once model resolution settles.
++  process.aborted = true;
++  process.kill?.('SIGTERM');
++  // Drop every key this run registered under, not just the one the abort named:
++  // the run also maps the provider-native id once pi announces it. Removing by
++  // handle keeps a run that already replaced this one untouched.
++  for (const [key, entry] of activePiProcesses) {
++    if (entry === process) {
++      activePiProcesses.delete(key);
++    }
++  }
++  return true;
++}
++
++function isPiSessionActive(sessionId: string): boolean {
++  return activePiProcesses.has(sessionId);
++}
++
++function getActivePiSessions(): string[] {
++  return Array.from(activePiProcesses.keys());
++}
++
++export const piRuntime = {
++  run: spawnPi,
++  abort: abortPiSession,
++};
++
++export {
++  spawnPi,
++  abortPiSession,
++  isPiSessionActive,
++  getActivePiSessions,
++  // Exported for the process-table cleanup test: the invariant it enforces
++  // (a finishing run must not evict a replacement) cannot be driven through
++  // the public surface without the same timing race it exists to prevent.
++  releasePiProcess as releasePiProcessForTest,
++  activePiProcesses as activePiProcessesForTest,
++};
+diff --git a/server/modules/providers/list/pi/pi-session-synchronizer.provider.ts b/server/modules/providers/list/pi/pi-session-synchronizer.provider.ts
+new file mode 100644
+index 00000000..06192657
+--- /dev/null
++++ b/server/modules/providers/list/pi/pi-session-synchronizer.provider.ts
+@@ -0,0 +1,302 @@
++import fsSync from 'node:fs';
++import path from 'node:path';
++
++import { sessionsDb } from '@/modules/database/index.js';
++import type { IProviderSessionSynchronizer } from '@/shared/interfaces.js';
++import type { AnyRecord } from '@/shared/types.js';
++import {
++  getPiSessionDir,
++  normalizeProviderTimestamp,
++  normalizeSessionName,
++  readOptionalString,
++} from '@/shared/utils.js';
++
++import { normalizeTranscriptEntry, readPiTranscriptEntries } from './pi-sessions.provider.js';
++
++const PROVIDER = 'pi';
++const FALLBACK_TITLE = 'Untitled pi Session';
++
++/**
++ * Clock-skew tolerance when checking that an app row predates a transcript
++ * session (app row created first, then pi spawns and writes the header).
++ */
++const PENDING_BINDING_SKEW_MS = 2 * 60 * 1000;
++
++/**
++ * How long after an app row's creation a first-run transcript may still be
++ * bound to it. Beyond this, the row is a stale leftover from a failed or
++ * abandoned run and must not absorb an unrelated CLI session's provider id.
++ */
++const PENDING_BINDING_WINDOW_MS = 15 * 60 * 1000;
++
++type PiSessionHeader = {
++  providerSessionId: string;
++  projectPath: string;
++  createdAt: string;
++};
++
++type PiSessionTranscript = {
++  path: string;
++  /** File mtime, ISO-normalized: pi appends resumes, so this is last activity. */
++  updatedAt: string;
++};
++
++/**
++ * Extracts the `session` header entry every pi transcript starts with.
++ *
++ * Verified against pi 0.85.1: the first line carries the provider-native
++ * session id, a timestamp, and the working directory the session ran in —
++ * the values the sidebar needs to place the session.
++ */
++const readPiSessionHeader = (entries: AnyRecord[]): PiSessionHeader | null => {
++  for (const entry of entries) {
++    if (readOptionalString(entry.type) !== 'session') {
++      continue;
++    }
++
++    const providerSessionId = readOptionalString(entry.id);
++    const projectPath = readOptionalString(entry.cwd);
++    if (!providerSessionId || !projectPath) {
++      return null;
++    }
++
++    return {
++      providerSessionId,
++      projectPath,
++      createdAt: normalizeProviderTimestamp(entry.timestamp),
++    };
++  }
++
++  return null;
++};
++
++/**
++ * Derives a sidebar title from one parsed transcript.
++ *
++ * An explicit `session_info` name wins when pi records one (not present in the
++ * 0.85.1 samples, so treated as optional); otherwise the first user prompt is
++ * used, read through the same normalizer the history view renders so
++ * `<images_input>`/`<files_input>` scaffolding never leaks into the title.
++ */
++const readPiSessionTitle = (entries: AnyRecord[]): string | undefined => {
++  for (const entry of entries) {
++    if (readOptionalString(entry.type) !== 'session_info') {
++      continue;
++    }
++
++    const name = readOptionalString(entry.name);
++    if (name) {
++      return name;
++    }
++  }
++
++  for (const entry of entries) {
++    const userText = normalizeTranscriptEntry(entry, null)
++      .find((message) => message.kind === 'text' && message.role === 'user')
++      ?.content;
++    if (userText) {
++      return userText;
++    }
++  }
++
++  return undefined;
++};
++
++/**
++ * Session indexer for pi's JSONL transcripts under `~/.pi/agent/sessions`.
++ */
++export class PiSessionSynchronizer implements IProviderSessionSynchronizer {
++  private readonly provider = PROVIDER;
++
++  /**
++   * Recursively scans the pi session directory and upserts every transcript
++   * modified since the given cursor into DB.
++   */
++  async synchronize(since?: Date): Promise<number> {
++    const transcripts = this.listSessionTranscripts(since);
++
++    let processed = 0;
++    for (const transcript of transcripts) {
++      if (this.upsertSession(transcript)) {
++        processed += 1;
++      }
++    }
++
++    return processed;
++  }
++
++  /**
++   * Handles watcher changes for one pi session transcript.
++   */
++  async synchronizeFile(filePath: string): Promise<string | null> {
++    if (!this.isPiSessionTranscript(filePath)) {
++      return null;
++    }
++
++    const transcript = this.readTranscriptTimestamp(filePath);
++    if (!transcript) {
++      return null;
++    }
++
++    return this.upsertSession(transcript);
++  }
++
++  /**
++   * Lists `.jsonl` transcripts under the pi session directory, recursively.
++   *
++   * The `since` cursor filters on mtime: pi appends resumed turns to the same
++   * file, so an updated mtime is what makes an existing session re-index.
++   */
++  private listSessionTranscripts(since?: Date): PiSessionTranscript[] {
++    const transcripts: PiSessionTranscript[] = [];
++    const walk = (directory: string): void => {
++      let entries: fsSync.Dirent[];
++      try {
++        entries = fsSync.readdirSync(directory, { withFileTypes: true });
++      } catch {
++        // A missing pi data directory just means "no sessions yet".
++        return;
++      }
++
++      for (const entry of entries) {
++        const entryPath = path.join(directory, entry.name);
++        if (entry.isDirectory()) {
++          walk(entryPath);
++        } else if (entry.name.endsWith('.jsonl')) {
++          const transcript = this.readTranscriptTimestamp(entryPath);
++          if (!transcript) {
++            continue;
++          }
++          if (since && new Date(transcript.updatedAt).getTime() < since.getTime()) {
++            continue;
++          }
++          transcripts.push(transcript);
++        }
++      }
++    };
++
++    walk(getPiSessionDir());
++    // File names lead with a timestamp, so lexical order is chronological and
++    // sidebar upserts land oldest-first.
++    return transcripts.sort((a, b) => a.path.localeCompare(b.path));
++  }
++
++  /** Reads one transcript's mtime as its last-activity timestamp. */
++  private readTranscriptTimestamp(filePath: string): PiSessionTranscript | null {
++    try {
++      return {
++        path: filePath,
++        updatedAt: normalizeProviderTimestamp(fsSync.statSync(filePath).mtimeMs),
++      };
++    } catch {
++      // The file may have been removed between listing and reading.
++      return null;
++    }
++  }
++
++  /**
++   * Only transcripts inside the pi session directory are pi sessions.
++   *
++   * The watcher hands this synchronizer every `.jsonl` change under the pi
++   * root; anything else (opencode's sqlite store, stray files) is ignored.
++   */
++  private isPiSessionTranscript(filePath: string): boolean {
++    if (!filePath.endsWith('.jsonl')) {
++      return false;
++    }
++
++    const relative = path.relative(getPiSessionDir(), filePath);
++    return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
++  }
++
++  /**
++   * Parses and upserts one pi transcript, returning the canonical session row
++   * id, or null when the file carries no usable session header.
++   */
++  private upsertSession(transcript: PiSessionTranscript): string | null {
++    let entries: AnyRecord[];
++    try {
++      entries = readPiTranscriptEntries(transcript.path);
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      console.warn(`[PiProvider] Failed to read session transcript ${transcript.path}:`, message);
++      return null;
++    }
++
++    const header = readPiSessionHeader(entries);
++    if (!header) {
++      return null;
++    }
++
++    const pendingAppSession = sessionsDb.getSessionByProviderSessionId(header.providerSessionId)
++      ?? sessionsDb.getSessionById(header.providerSessionId)
++      ?? this.findCorrelatedPendingAppSession(header);
++    if (pendingAppSession && !pendingAppSession.provider_session_id) {
++      // Slow model responses can let the watcher index the transcript before
++      // the runtime reports its provider id back through the websocket
++      // mapping. Bind that id to the fresh app row first so the watcher does
++      // not create a temporary provider-id sidebar entry for the same session.
++      sessionsDb.assignProviderSessionId(pendingAppSession.session_id, header.providerSessionId);
++    }
++
++    // App-created sessions are keyed by an app id, so disk-discovered provider
++    // ids must be resolved through the provider-id mapping first.
++    const existingSession = sessionsDb.getSessionByProviderSessionId(header.providerSessionId)
++      ?? sessionsDb.getSessionById(header.providerSessionId);
++    const existingName = existingSession?.custom_name;
++
++    let nextName: string | undefined;
++    if (existingName && existingName !== FALLBACK_TITLE) {
++      nextName = existingName;
++    } else {
++      nextName = readPiSessionTitle(entries);
++    }
++
++    // pi keeps every session of a working directory in one shared tree, so
++    // jsonl_path must stay null to avoid deleting that folder when one app
++    // session is removed.
++    return sessionsDb.createSession(
++      header.providerSessionId,
++      this.provider,
++      header.projectPath,
++      normalizeSessionName(nextName, FALLBACK_TITLE),
++      header.createdAt,
++      transcript.updatedAt,
++      null,
++    );
++  }
++
++  /**
++   * Project-scoped fallback for the pending-row race, guarded by correlation.
++   *
++   * `findLatestPendingAppSession` matches only provider + project path, so an
++   * unrelated pending row (another tab's in-flight run in the same project, or
++   * a stale row left by a failed run) could otherwise steal the provider id:
++   * `assignProviderSessionId` would bind it, and the sidebar would show a
++   * direct CLI session under that app row. A transcript only correlates with
++   * an app row when the row was created before the transcript's session
++   * started (the app allocates the row first, then spawns pi) and recently
++   * enough to still belong to the run that created it.
++   */
++  private findCorrelatedPendingAppSession(header: PiSessionHeader) {
++    const candidate = sessionsDb.findLatestPendingAppSession(this.provider, header.projectPath);
++    if (!candidate) {
++      return null;
++    }
++
++    const rowCreatedAt = Date.parse(candidate.created_at);
++    const sessionStartedAt = Date.parse(header.createdAt);
++    if (!Number.isFinite(rowCreatedAt) || !Number.isFinite(sessionStartedAt)) {
++      return null;
++    }
++
++    if (rowCreatedAt > sessionStartedAt + PENDING_BINDING_SKEW_MS) {
++      return null;
++    }
++    if (sessionStartedAt - rowCreatedAt > PENDING_BINDING_WINDOW_MS) {
++      return null;
++    }
++
++    return candidate;
++  }
++}
+diff --git a/server/modules/providers/list/pi/pi-sessions.provider.test.ts b/server/modules/providers/list/pi/pi-sessions.provider.test.ts
+new file mode 100644
+index 00000000..fd00a743
+--- /dev/null
++++ b/server/modules/providers/list/pi/pi-sessions.provider.test.ts
+@@ -0,0 +1,443 @@
++import assert from 'node:assert/strict';
++import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++import test from 'node:test';
++
++import type { NormalizedMessage } from '@/shared/types.js';
++
++import { mapPiEventToMessages, PiSessionsProvider, selectActivePiBranch } from './pi-sessions.provider.js';
++
++const kinds = (messages: NormalizedMessage[]) => messages.map((message) => message.kind);
++
++test('mapPiEventToMessages maps pi stream events onto normalized messages', () => {
++  const delta = mapPiEventToMessages(
++    { type: 'message_update', assistantMessageEvent: { type: 'text_delta', contentIndex: 0, delta: 'Hi' } },
++    's1',
++  );
++  assert.deepEqual(kinds(delta), ['stream_delta']);
++  assert.equal(delta[0]?.content, 'Hi');
++  assert.equal(delta[0]?.sessionId, 's1');
++  assert.equal(delta[0]?.provider, 'pi');
++
++  // `thinking_delta` emits nothing: the frontend appends every non-
++  // stream_delta message verbatim, so forwarding per-token deltas would
++  // render one thinking fragment per token.
++  assert.deepEqual(
++    mapPiEventToMessages(
++      { type: 'message_update', assistantMessageEvent: { type: 'thinking_delta', contentIndex: 0, delta: 'hmm' } },
++      's1',
++    ),
++    [],
++  );
++
++  // `thinking_end` carries the full block content (pi 0.85.1) and is
++  // the single thinking outlet: one message per reasoning block, verbatim
++  // (no trim), so leading/trailing whitespace survives.
++  const thinkingEnd = mapPiEventToMessages(
++    { type: 'message_update', assistantMessageEvent: { type: 'thinking_end', contentIndex: 0, content: '  full reasoning\n' } },
++    's1',
++  );
++  assert.deepEqual(kinds(thinkingEnd), ['thinking']);
++  assert.equal(thinkingEnd[0]?.content, '  full reasoning\n');
++  assert.equal(thinkingEnd[0]?.sessionId, 's1');
++  assert.equal(thinkingEnd[0]?.provider, 'pi');
++
++  // An empty thinking block emits nothing.
++  assert.deepEqual(
++    mapPiEventToMessages(
++      { type: 'message_update', assistantMessageEvent: { type: 'thinking_end', contentIndex: 0, content: '' } },
++      's1',
++    ),
++    [],
++  );
++
++  // Remaining marker events stay silent: `text_end` would duplicate what the
++  // stream_delta channel already drew, `thinking_start` starts nothing that
++  // `thinking_end` does not carry itself.
++  for (const eventType of [
++    'text_start',
++    'text_end',
++    'thinking_start',
++    'toolcall_start',
++    'toolcall_delta',
++    'toolcall_end',
++  ]) {
++    assert.deepEqual(
++      mapPiEventToMessages(
++        { type: 'message_update', assistantMessageEvent: { type: eventType, contentIndex: 0, delta: 'x', content: 'x' } },
++        's1',
++      ),
++      [],
++      eventType,
++    );
++  }
++
++  const toolUse = mapPiEventToMessages(
++    { type: 'tool_execution_start', toolCallId: 'c1', toolName: 'bash', args: { command: 'ls' } },
++    's1',
++  );
++  assert.deepEqual(kinds(toolUse), ['tool_use']);
++  assert.equal(toolUse[0]?.toolName, 'bash');
++  assert.equal(toolUse[0]?.toolId, 'c1');
++  assert.deepEqual(toolUse[0]?.toolInput, { command: 'ls' });
++
++  const toolResult = mapPiEventToMessages(
++    {
++      type: 'tool_execution_end',
++      toolCallId: 'c1',
++      toolName: 'bash',
++      result: { content: [{ type: 'text', text: 'a\nb' }] },
++      isError: false,
++    },
++    's1',
++  );
++  assert.deepEqual(kinds(toolResult), ['tool_result']);
++  assert.equal(toolResult[0]?.toolId, 'c1');
++  // The transcript renderer reads the top-level `content` string; without it
++  // the client's formatToolResultContent crashes on `.trim()`.
++  assert.equal(toolResult[0]?.content, 'a\nb');
++  assert.deepEqual(toolResult[0]?.toolResult, { content: 'a\nb', isError: false });
++
++  // Streaming partial results only exist for live progress; the transcript
++  // draws the tool card from start/end alone.
++  assert.deepEqual(
++    mapPiEventToMessages({ type: 'tool_execution_update', toolCallId: 'c1', partialResult: { content: [] } }, 's1'),
++    [],
++  );
++
++  assert.deepEqual(
++    kinds(mapPiEventToMessages({ type: 'message_end', message: { role: 'assistant', content: [] } }, 's1')),
++    ['stream_end'],
++  );
++  // User turns were already drawn client-side as the optimistic prompt.
++  assert.deepEqual(
++    mapPiEventToMessages({ type: 'message_end', message: { role: 'user', content: [{ type: 'text', text: 'q' }] } }, 's1'),
++    [],
++  );
++  assert.deepEqual(
++    mapPiEventToMessages({ type: 'message_start', message: { role: 'assistant', content: [] } }, 's1'),
++    [],
++  );
++});
++
++test('mapPiEventToMessages maps model errors to error rows and ignores lifecycle events', () => {
++  // pi exits 0 even when the model call failed (pi 0.85.1), so this
++  // mapping is the only channel a 403/500 has to the UI.
++  const modelError = mapPiEventToMessages(
++    {
++      type: 'message_end',
++      message: {
++        role: 'assistant',
++        content: [{ type: 'text', text: '' }],
++        stopReason: 'error',
++        errorMessage: '403 {"error":"forbidden"}',
++      },
++    },
++    's1',
++  );
++  assert.deepEqual(kinds(modelError), ['error']);
++  assert.equal(modelError[0]?.content, '403 {"error":"forbidden"}');
++  assert.equal(modelError[0]?.isError, true);
++
++  // turn_end repeats the same failure; message_end stays the single outlet so
++  // the error is not emitted twice per run.
++  assert.deepEqual(
++    mapPiEventToMessages(
++      { type: 'turn_end', message: { role: 'assistant', content: [], stopReason: 'error', errorMessage: '403' } },
++      's1',
++    ),
++    [],
++  );
++
++  assert.deepEqual(kinds(mapPiEventToMessages({ type: 'extension_error', error: 'boom' }, 's1')), ['error']);
++
++  for (const eventType of [
++    'session',
++    'agent_start',
++    'agent_end',
++    'agent_settled',
++    'turn_start',
++    'compaction_start',
++    'compaction_end',
++    'auto_retry_start',
++    'queue_update',
++  ]) {
++    assert.deepEqual(mapPiEventToMessages({ type: eventType }, 's1'), [], eventType);
++  }
++
++  assert.deepEqual(mapPiEventToMessages('not-an-object', 's1'), []);
++  assert.deepEqual(mapPiEventToMessages(null, 's1'), []);
++});
++
++const PI_SESSION_ID = 'f47ac10b-9d3e-4c7a-8b21-5e6f7a8b9c0d';
++// pi encodes the cwd into the folder name; the reader must not depend on that
++// scheme, so the fixture uses an opaque directory name.
++const PI_SESSION_FILE = `2026-09-12T13-52-05-003Z_${PI_SESSION_ID}.jsonl`;
++
++const historyLine = (entry: Record<string, unknown>) => JSON.stringify(entry);
++
++const HISTORY_LINES = [
++  historyLine({
++    type: 'session',
++    version: 3,
++    id: PI_SESSION_ID,
++    timestamp: '2026-09-12T13:52:05.003Z',
++    cwd: '/tmp/fake-project',
++  }),
++  // pi also records model/thinking-level switches in the same file.
++  historyLine({ type: 'model_change', model: 'glm-5.3' }),
++  historyLine({ type: 'thinking_level_change', level: 'high' }),
++  historyLine({
++    type: 'message',
++    id: 'm-user',
++    parentId: null,
++    timestamp: '2026-09-12T13:52:06.000Z',
++    message: {
++      role: 'user',
++      content: [
++        {
++          type: 'text',
++          text: 'List the files\n\n<images_input>\n1. /tmp/shot.png\n</images_input>\n\n<files_input>\n1. /tmp/notes.md\n</files_input>',
++        },
++      ],
++      api: 'anthropic-messages',
++      provider: 'anthropic',
++      model: 'glm-5.3',
++      stopReason: 'stop',
++      usage: { input: 10, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 10 },
++    },
++  }),
++  historyLine({
++    type: 'message',
++    id: 'm-asst-1',
++    parentId: 'm-user',
++    timestamp: '2026-09-12T13:52:07.000Z',
++    message: {
++      role: 'assistant',
++      content: [
++        { type: 'thinking', thinking: 'Peek at the directory first.', thinkingSignature: 'sig' },
++        { type: 'text', text: 'Running ls.' },
++        { type: 'toolCall', id: 'call_1', name: 'bash', arguments: { command: 'ls' } },
++      ],
++      api: 'anthropic-messages',
++      provider: 'anthropic',
++      model: 'glm-5.3',
++      stopReason: 'toolUse',
++      usage: { input: 100, output: 20, cacheRead: 10, cacheWrite: 5, totalTokens: 135 },
++    },
++  }),
++  historyLine({
++    type: 'message',
++    id: 'm-tool-1',
++    parentId: 'm-asst-1',
++    timestamp: '2026-09-12T13:52:08.000Z',
++    message: {
++      role: 'toolResult',
++      toolCallId: 'call_1',
++      toolName: 'bash',
++      content: [{ type: 'text', text: 'a.txt\nb.txt' }],
++      isError: false,
++      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
++    },
++  }),
++  historyLine({
++    type: 'message',
++    id: 'm-asst-2',
++    parentId: 'm-tool-1',
++    timestamp: '2026-09-12T13:52:09.000Z',
++    message: {
++      role: 'assistant',
++      content: [{ type: 'text', text: 'Two files found.' }],
++      api: 'anthropic-messages',
++      provider: 'anthropic',
++      model: 'glm-5.3',
++      stopReason: 'stop',
++      usage: { input: 150, output: 30, cacheRead: 20, cacheWrite: 0, totalTokens: 200 },
++    },
++  }),
++];
++
++const patchHomeDir = (nextHomeDir: string) => {
++  const original = os.homedir;
++  (os as any).homedir = () => nextHomeDir;
++  return () => {
++    (os as any).homedir = original;
++  };
++};
++
++async function writePiSessionFixture(homeDir: string, lines: string[]): Promise<void> {
++  const sessionDir = path.join(homeDir, '.pi', 'agent', 'sessions', '--tmp-fake-project');
++  await mkdir(sessionDir, { recursive: true });
++  await writeFile(path.join(sessionDir, PI_SESSION_FILE), `${lines.join('\n')}\n`, 'utf8');
++}
++
++async function withIsolatedPiHome(run: (homeDir: string) => Promise<void>): Promise<void> {
++  const tempRoot = await mkdtemp(path.join(os.tmpdir(), 'pi-sessions-'));
++  const restoreHomeDir = patchHomeDir(tempRoot);
++  try {
++    await run(tempRoot);
++  } finally {
++    restoreHomeDir();
++    await rm(tempRoot, { recursive: true, force: true });
++  }
++}
++
++test('fetchHistory reads a pi session jsonl with attachments, tool calls and token usage', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    await writePiSessionFixture(homeDir, HISTORY_LINES);
++    const provider = new PiSessionsProvider();
++    // The reader addresses the transcript by the provider-native id recorded on
++    // the session row, never by the app-facing id it was called with.
++    const history = await provider.fetchHistory('app-row', { providerSessionId: PI_SESSION_ID });
++
++    assert.equal(history.total, 6);
++    const [user, thinking, assistantText, toolUse, toolResult, finalText] = history.messages;
++
++    assert.equal(user?.kind, 'text');
++    assert.equal(user?.role, 'user');
++    assert.equal(user?.content, 'List the files');
++    assert.deepEqual(user?.images, [{ path: '/tmp/shot.png' }]);
++    assert.deepEqual(user?.files, [{ path: '/tmp/notes.md' }]);
++
++    assert.equal(thinking?.kind, 'thinking');
++    assert.equal(thinking?.content, 'Peek at the directory first.');
++
++    assert.equal(assistantText?.kind, 'text');
++    assert.equal(assistantText?.role, 'assistant');
++    assert.equal(assistantText?.content, 'Running ls.');
++
++    assert.equal(toolUse?.kind, 'tool_use');
++    assert.equal(toolUse?.toolName, 'bash');
++    assert.equal(toolUse?.toolId, 'call_1');
++    assert.deepEqual(toolUse?.toolInput, { command: 'ls' });
++
++    assert.equal(toolResult?.kind, 'tool_result');
++    assert.equal(toolResult?.toolId, 'call_1');
++    // Top-level `content` mirrors claude's tool_result shape; the client
++    // transcript reads it directly and crashes on undefined without it.
++    assert.equal(toolResult?.content, 'a.txt\nb.txt');
++    assert.deepEqual(toolResult?.toolResult, { content: 'a.txt\nb.txt', isError: false });
++
++    assert.equal(finalText?.content, 'Two files found.');
++
++    // The last assistant usage is the run's final accounting.
++    assert.deepEqual(history.tokenUsage, {
++      used: 200,
++      inputTokens: 170,
++      outputTokens: 30,
++      breakdown: { input: 170, output: 30 },
++      totalTokens: 200,
++    });
++  });
++});
++
++test('fetchHistory pages from the tail like every other provider', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    await writePiSessionFixture(homeDir, HISTORY_LINES);
++    const provider = new PiSessionsProvider();
++
++    const page = await provider.fetchHistory('app-row', { providerSessionId: PI_SESSION_ID, limit: 2 });
++    assert.equal(page.total, 6);
++    assert.equal(page.messages.length, 2);
++    assert.deepEqual(kinds(page.messages), ['tool_result', 'text']);
++    assert.equal(page.hasMore, true);
++
++    const older = await provider.fetchHistory('app-row', { providerSessionId: PI_SESSION_ID, limit: 2, offset: 4 });
++    assert.deepEqual(older.messages.map((message) => message.content), ['List the files', 'Peek at the directory first.']);
++    assert.equal(older.hasMore, false);
++
++    // Partial ids match the transcript file name, so callers may pass the
++    // short form a user copied out of a title.
++    const byFragment = await provider.fetchHistory('f47ac10b');
++    assert.equal(byFragment.total, 6);
++  });
++});
++
++test('fetchHistory surfaces pi model errors recorded in the transcript', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    await writePiSessionFixture(homeDir, [
++      historyLine({ type: 'session', version: 3, id: PI_SESSION_ID, timestamp: '2026-09-12T13:52:05.003Z' }),
++      historyLine({
++        type: 'message',
++        id: 'm-err',
++        parentId: null,
++        timestamp: '2026-09-12T13:52:06.000Z',
++        message: {
++          role: 'assistant',
++          content: [{ type: 'text', text: '' }],
++          stopReason: 'error',
++          errorMessage: '403 {"error":"forbidden"}',
++          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
++        },
++      }),
++    ]);
++    const provider = new PiSessionsProvider();
++    const history = await provider.fetchHistory(PI_SESSION_ID);
++
++    const errorRow = history.messages.find((message) => message.kind === 'error');
++    assert.equal(errorRow?.content, '403 {"error":"forbidden"}');
++  });
++});
++
++test('fetchHistory returns an empty page when no transcript matches', async () => {
++  await withIsolatedPiHome(async (homeDir) => {
++    await writePiSessionFixture(homeDir, HISTORY_LINES);
++    const provider = new PiSessionsProvider();
++    const history = await provider.fetchHistory('missing-session');
++
++    assert.deepEqual(history, { messages: [], total: 0, hasMore: false, offset: 0, limit: null });
++  });
++});
++
++test('selectActivePiBranch keeps only the branch pi is currently on', () => {
++  // A retried turn leaves both attempts in the file as children of the same
++  // parent: the failed one first, the retry second. Reading file order would
++  // replay both, so history must follow the leaf's parent chain instead.
++  const entries = [
++    { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'hi' } },
++    { type: 'message', id: 'a1', parentId: 'u1', message: { role: 'assistant', content: [], stopReason: 'error' } },
++    { type: 'message', id: 'a2', parentId: 'u1', message: { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } },
++  ];
++
++  const selected = selectActivePiBranch(entries);
++
++  assert.deepEqual(selected.map((entry) => entry.id), ['u1', 'a2']);
++});
++
++test('selectActivePiBranch walks a deeper abandoned branch back to its fork', () => {
++  const entries = [
++    { type: 'message', id: 'u1', parentId: null, message: { role: 'user', content: 'one' } },
++    { type: 'message', id: 'a1', parentId: 'u1', message: { role: 'assistant', content: [{ type: 'text', text: 'first' }] } },
++    { type: 'message', id: 'u2', parentId: 'a1', message: { role: 'user', content: 'two' } },
++    // Abandoned attempt on the second turn, then the retry.
++    { type: 'message', id: 'a2abandoned', parentId: 'u2', message: { role: 'assistant', content: [], stopReason: 'error' } },
++    { type: 'message', id: 'a2', parentId: 'u2', message: { role: 'assistant', content: [{ type: 'text', text: 'second' }] } },
++  ];
++
++  const selected = selectActivePiBranch(entries);
++
++  assert.deepEqual(selected.map((entry) => entry.id), ['u1', 'a1', 'u2', 'a2']);
++});
++
++test('selectActivePiBranch returns file order unchanged for a transcript with no ids', () => {
++  // Version 1 transcripts (and anything else without the tree fields) cannot be
++  // walked, so the linear order the file recorded is the answer.
++  const entries = [
++    { type: 'message', message: { role: 'user', content: 'a' } },
++    { type: 'message', message: { role: 'assistant', content: [{ type: 'text', text: 'b' }] } },
++  ];
++
++  assert.deepEqual(selectActivePiBranch(entries), entries);
++});
++
++test('selectActivePiBranch stops on a corrupted parent cycle', () => {
++  const entries = [
++    { type: 'message', id: 'x', parentId: 'y', message: { role: 'user', content: 'a' } },
++    { type: 'message', id: 'y', parentId: 'x', message: { role: 'assistant', content: [] } },
++  ];
++
++  // Must terminate rather than loop forever.
++  const selected = selectActivePiBranch(entries);
++  assert.ok(selected.length > 0 && selected.length <= entries.length);
++});
+diff --git a/server/modules/providers/list/pi/pi-sessions.provider.ts b/server/modules/providers/list/pi/pi-sessions.provider.ts
+new file mode 100644
+index 00000000..c2eeabf2
+--- /dev/null
++++ b/server/modules/providers/list/pi/pi-sessions.provider.ts
+@@ -0,0 +1,583 @@
++import fsSync from 'node:fs';
++import path from 'node:path';
++
++import { parseFilesInputTag, parseImagesInputTag } from '@/shared/image-attachments.js';
++import type { IProviderSessions } from '@/shared/interfaces.js';
++import type { AnyRecord, FetchHistoryOptions, FetchHistoryResult, NormalizedMessage } from '@/shared/types.js';
++import {
++  createNormalizedMessage,
++  generateMessageId,
++  getPiSessionDir,
++  normalizeProviderTimestamp,
++  readObjectRecord,
++  readOptionalString,
++  sliceTailPage,
++} from '@/shared/utils.js';
++
++const PROVIDER = 'pi';
++
++/**
++ * Reads one string field verbatim when non-empty.
++ *
++ * Unlike `readOptionalString` this never trims: streaming deltas and tool
++ * output carry significant leading/trailing whitespace (" world", "ls\n"),
++ * which a trimmed read would silently corrupt.
++ */
++const readVerbatimString = (value: unknown): string | undefined => {
++  return typeof value === 'string' && value.length > 0 ? value : undefined;
++};
++
++/**
++ * Joins one tool result's content blocks into the display string every other
++ * provider carries on `toolResult.content`. pi sends `[{type:'text',text}]`
++ * blocks (probe/sample4.jsonl) but tolerates plain strings.
++ */
++const joinBlockText = (value: unknown): string => {
++  if (typeof value === 'string') {
++    return value;
++  }
++
++  if (!Array.isArray(value)) {
++    return '';
++  }
++
++  return value
++    .map((block) => readVerbatimString(readObjectRecord(block)?.text) ?? '')
++    .filter(Boolean)
++    .join('\n');
++};
++
++/**
++ * Maps pi's cumulative usage counters onto the token-usage shape opencode
++ * history returns (`used`/`inputTokens`/`outputTokens`/`breakdown`). Cache
++ * reads count as input, matching the pi runtime's token budget. pi's own
++ * `totalTokens` is kept alongside so cost-heavy consumers see the raw figure.
++ */
++const buildPiTokenUsage = (usage: AnyRecord): AnyRecord | undefined => {
++  const inputTokens = Number(usage.input ?? 0) + Number(usage.cacheRead ?? 0);
++  const outputTokens = Number(usage.output ?? 0);
++  const totalTokens = Number(usage.totalTokens ?? 0);
++  const used = totalTokens || inputTokens + outputTokens;
++  if (used <= 0) {
++    return undefined;
++  }
++
++  return {
++    used,
++    inputTokens,
++    outputTokens,
++    breakdown: {
++      input: inputTokens,
++      output: outputTokens,
++    },
++    totalTokens,
++  };
++};
++
++/**
++ * Maps one live `pi -p --mode json` event onto zero or more normalized
++ * messages. This is the real body behind the runtime's
++ * `context.normalizeMessage` callback (pi-runtime.provider.js).
++ *
++ * Event → message mapping (verified against probe/*.jsonl, pi 0.85.1):
++ * - `message_update` + `text_delta`     → `stream_delta` (content = delta)
++ * - `message_update` + `thinking_end`   → `thinking` (content = the event's
++ *   full content, verbatim) — exactly one message per reasoning block. The
++ *   aggregation lives server-side because the frontend has no thinking
++ *   aggregation channel: only `stream_delta` is throttled into a single
++ *   bubble while every other kind is appended one row per message, so
++ *   forwarding each `thinking_delta` would flood the transcript with one
++ *   fragment per token. pi makes this cheap: `thinking_end` carries the
++ *   block's full content (pi 0.85.1).
++ * - `message_update` + `thinking_start`/`thinking_delta` → [] (dropped; the
++ *   `thinking_end` full content replaces them)
++ * - `message_update` + other `*_start`/`*_end` (incl. `text_end`, whose full
++ *   content would duplicate what the stream_delta channel already drew) and
++ *   `toolcall_*` → []
++ * - `message_update` + `toolcall_*`     → [] (tool activity is carried by the
++ *   top-level `tool_execution_*` events instead)
++ * - `tool_execution_start`              → `tool_use` (toolName/toolInput/toolId)
++ * - `tool_execution_end`                → `tool_result` (toolId + content + toolResult)
++ *   Deliberately NOT folded onto the `tool_use`: pi emits start and end as
++ *   separate events, so a standalone `tool_result` keyed by `toolId` is what
++ *   the transcript renderer already pairs with its `tool_use` row.
++ * - `tool_execution_update`             → [] (partial results duplicate the final one)
++ * - `message_end` (role assistant)      → `stream_end`
++ * - `message_end` carrying `stopReason: 'error'` plus `errorMessage`
++ *                                       → `error` — pi exits 0 even when the
++ *   model call failed, so this is the runtime's ONLY error signal. pi echoes
++ *   the same failed turn on `message_start`/`turn_end`; `message_end` stays
++ *   the single outlet so one failed turn surfaces exactly one error row.
++ * - `extension_error`                   → `error` (content = the error field)
++ * - `message_start`/user echoes/`turn_*`/`agent_*`/`session`/`model_change`/
++ *   `thinking_level_change`/`agent_settled` → []
++ *
++ * Exported so the runtime tests drive the exact mapping the live stream uses.
++ */
++export function mapPiEventToMessages(rawEvent: unknown, sessionId: string | null): NormalizedMessage[] {
++  const event = readObjectRecord(rawEvent);
++  if (!event) {
++    return [];
++  }
++
++  const type = readOptionalString(event.type);
++  const message = readObjectRecord(event.message);
++  const timestamp = normalizeProviderTimestamp(event.timestamp ?? message?.timestamp);
++  const build = (fields: { kind: NormalizedMessage['kind'] } & Record<string, unknown>): NormalizedMessage => createNormalizedMessage({
++    ...fields,
++    sessionId,
++    timestamp,
++    provider: PROVIDER,
++  });
++
++  if (type === 'message_update') {
++    const update = readObjectRecord(event.assistantMessageEvent);
++    const updateType = readOptionalString(update?.type);
++
++    if (updateType === 'text_delta') {
++      const delta = readVerbatimString(update?.delta);
++      if (delta) {
++        return [build({ kind: 'stream_delta', content: delta })];
++      }
++      return [];
++    }
++
++    // Thinking aggregates into ONE message per reasoning block, emitted from
++    // `thinking_end`. The aggregation must happen server-side: the frontend
++    // only folds `stream_delta` into a single throttled bubble
++    // (useChatRealtimeHandlers) and appends every other kind verbatim via
++    // sessionStore.appendRealtime, so streaming `thinking_delta` events would
++    // render one thinking fragment per token. pi's `thinking_end` already
++    // carries the full block content (pi 0.85.1), so start/delta are
++    // simply dropped. Content is read verbatim — no trim.
++    if (updateType === 'thinking_end') {
++      const content = readVerbatimString(update?.content);
++      if (content) {
++        return [build({ kind: 'thinking', content })];
++      }
++      return [];
++    }
++
++    // `*_start` markers, `text_end` (its full content would duplicate what the
++    // stream_delta channel already drew) and `toolcall_*` emit nothing.
++    return [];
++  }
++
++  if (type === 'tool_execution_start') {
++    return [build({
++      kind: 'tool_use',
++      toolName: readOptionalString(event.toolName) ?? 'Tool',
++      toolInput: event.args ?? {},
++      toolId: readOptionalString(event.toolCallId) ?? generateMessageId('tool'),
++    })];
++  }
++
++  if (type === 'tool_execution_end') {
++    const resultText = joinBlockText(readObjectRecord(event.result)?.content ?? event.result);
++    const toolResult: NonNullable<NormalizedMessage['toolResult']> = {
++      content: resultText,
++    };
++    // pi reports `isError` on the end event (probe/sample4.jsonl); treat it as
++    // optional so an absent field stays undefined rather than a false claim.
++    if (event.isError !== undefined) {
++      toolResult.isError = event.isError === true;
++    }
++
++    return [build({
++      kind: 'tool_result',
++      toolId: readOptionalString(event.toolCallId),
++      toolName: readOptionalString(event.toolName),
++      // The transcript renderer reads the top-level `content` string
++      // (claude tool_result convention); `toolResult` stays for consumers of
++      // the structured payload.
++      content: resultText,
++      toolResult,
++    })];
++  }
++
++  if (type === 'message_start' || type === 'message_end' || type === 'turn_end') {
++    // Error mapping must win over the stream_end mapping: the assistant
++    // message_end of a failed turn carries the error instead of content. The
++    // message_start/turn_end echoes of the same failure stay silent so one
++    // failed turn surfaces exactly one error row.
++    if (type === 'message_end' && readOptionalString(message?.stopReason) === 'error') {
++      const errorContent = readOptionalString(message?.errorMessage);
++      if (errorContent) {
++        return [build({ kind: 'error', content: errorContent, isError: true })];
++      }
++    }
++
++    if (type === 'message_end' && readOptionalString(message?.role) === 'assistant') {
++      return [build({ kind: 'stream_end' })];
++    }
++
++    // User/toolResult message echoes and turn bookkeeping emit nothing.
++    return [];
++  }
++
++  if (type === 'extension_error') {
++    return [build({
++      kind: 'error',
++      content: readOptionalString(event.error) ?? readOptionalString(event.errorMessage) ?? 'Unknown pi error',
++      isError: true,
++    })];
++  }
++
++  // session/agent_*/turn_start/model_change/thinking_level_change/agent_settled
++  return [];
++}
++
++/**
++ * Locates one pi transcript by provider-native session id.
++ *
++ * pi writes `~/.pi/agent/sessions/<encoded-cwd>/<ISO timestamp>_<uuid>.jsonl`
++ * and keeps every session of one working directory flat in that folder, so a
++ * recursive `*<id>*.jsonl` match covers both full uuids and the partial ids
++ * `pi --session` accepts. Names start with a timestamp, so lexical order is
++ * chronological and the last match is the newest.
++ */
++const findPiSessionTranscript = (sessionId: string): string | null => {
++  const normalizedId = sessionId.trim();
++  if (
++    !normalizedId
++    || normalizedId.includes('..')
++    || normalizedId.includes('/')
++    || normalizedId.includes('\\')
++  ) {
++    return null;
++  }
++
++  const matches: string[] = [];
++  const walk = (directory: string): void => {
++    let entries: fsSync.Dirent[];
++    try {
++      entries = fsSync.readdirSync(directory, { withFileTypes: true });
++    } catch {
++      // A missing pi data directory just means "no sessions yet".
++      return;
++    }
++
++    for (const entry of entries) {
++      const entryPath = path.join(directory, entry.name);
++      if (entry.isDirectory()) {
++        walk(entryPath);
++      } else if (entry.name.endsWith('.jsonl') && entry.name.includes(normalizedId)) {
++        matches.push(entryPath);
++      }
++    }
++  };
++
++  walk(getPiSessionDir());
++  return matches.sort().at(-1) ?? null;
++};
++
++/**
++ * Reads a pi JSONL transcript into parsed entries, skipping malformed lines.
++ *
++ * Exported so the session synchronizer reuses the exact reader (torn last
++ * line tolerance included) when indexing the same transcripts into the DB.
++ */
++export const readPiTranscriptEntries = (transcriptPath: string): AnyRecord[] => {
++  const entries: AnyRecord[] = [];
++  const lines = fsSync.readFileSync(transcriptPath, 'utf8').split(/\r?\n/);
++
++  for (const line of lines) {
++    if (!line.trim()) {
++      continue;
++    }
++
++    try {
++      const entry = readObjectRecord(JSON.parse(line));
++      if (entry) {
++        entries.push(entry);
++      }
++    } catch {
++      // pi may leave a torn last line while appending; skip it.
++    }
++  }
++
++  return entries;
++};
++
++/**
++ * Narrows a transcript to the branch pi is currently on.
++ *
++ * pi stores a session as a tree: every entry carries `id`/`parentId`, so an
++ * edited message, a `/tree` retreat, or an automatic retry leaves the superseded
++ * attempt in the same file as a second child of the same parent. Reading the
++ * file in order would therefore replay abandoned turns — a failed attempt and
++ * its successful retry both appear, abandoned tool calls show up, and the paged
++ * tail can start inside a branch the user left. Only the active branch is the
++ * conversation the model sees, so only it belongs in history.
++ *
++ * The leaf is the last entry appended (pi appends as it goes), and walking its
++ * `parentId` chain back to the root yields that branch. Files that carry no
++ * `id`/`parentId` at all — version 1, or a foreign writer — fall back to the
++ * file order unchanged.
++ */
++export const selectActivePiBranch = (entries: AnyRecord[]): AnyRecord[] => {
++  type BranchEntry = { entry: AnyRecord; index: number };
++
++  const byId = new Map<string, BranchEntry>();
++  let leaf: BranchEntry | null = null;
++
++  entries.forEach((entry, index) => {
++    const id = readOptionalString(entry.id);
++    if (!id) {
++      return;
++    }
++    const branchEntry: BranchEntry = { entry, index };
++    // Later entries win: a duplicated id can only mean a rewrite, and the
++    // rewrite is the live one.
++    byId.set(id, branchEntry);
++    leaf = branchEntry;
++  });
++
++  // No ids at all: not a tree this reader understands, so keep file order.
++  if (!leaf || byId.size === 0) {
++    return entries;
++  }
++
++  const chain: BranchEntry[] = [];
++  const seen = new Set<string>();
++  let cursor: BranchEntry | null = leaf;
++  while (cursor) {
++    const id = readOptionalString(cursor.entry.id);
++    if (!id || seen.has(id)) {
++      // A cycle can only come from corruption; stop rather than loop.
++      break;
++    }
++    seen.add(id);
++    chain.push(cursor);
++
++    const parentId = readOptionalString(cursor.entry.parentId);
++    cursor = parentId ? byId.get(parentId) ?? null : null;
++  }
++
++  // Entries without an id (session header, and any torn-but-parsed line) are
++  // never part of the chain, so return the chain in file order to keep the
++  // relative order the transcript recorded.
++  return chain
++    .sort((left, right) => left.index - right.index)
++    .map((branchEntry) => branchEntry.entry);
++};
++
++/**
++ * Normalizes one parsed transcript entry into history messages.
++ *
++ * Only `type: 'message'` entries expand — headers (`session`), model and
++ * thinking-level changes, and labels are metadata, not conversation. Within a
++ * message entry the role decides the shape:
++ * - `user`       → one `text` message, with `<images_input>`/`<files_input>`
++ *                  blocks stripped back into images/files fields
++ * - `assistant`  → content blocks expand in order: text → `text`,
++ *                  thinking → `thinking`, toolCall → `tool_use`
++ * - `toolResult` → standalone `tool_result` keyed by its toolCallId, carrying
++ *                  the block text as the top-level `content` string
++ *
++ * Exported so the session synchronizer titles sessions from the same user-text
++ * extraction (attachment tags stripped) that history rendering uses.
++ */
++export const normalizeTranscriptEntry = (entry: AnyRecord, sessionId: string | null): NormalizedMessage[] => {
++  if (readOptionalString(entry.type) !== 'message') {
++    return [];
++  }
++
++  const message = readObjectRecord(entry.message);
++  const role = readOptionalString(message?.role);
++  const timestamp = normalizeProviderTimestamp(entry.timestamp ?? message?.timestamp);
++  const baseId = readOptionalString(entry.id) ?? generateMessageId('pi');
++  const blocks = Array.isArray(message?.content) ? message.content : [];
++
++  const normalized: NormalizedMessage[] = [];
++
++  if (role === 'user' || role === 'assistant') {
++    const messageRole = role === 'user' ? 'user' : 'assistant';
++
++    // A failed turn is persisted with `stopReason: 'error'` + `errorMessage`
++    // on the assistant entry (pi exits 0 regardless); surface it as an error
++    // row before whatever partial content the entry carries.
++    if (messageRole === 'assistant' && readOptionalString(message?.stopReason) === 'error') {
++      const errorContent = readOptionalString(message?.errorMessage);
++      if (errorContent) {
++        normalized.push(createNormalizedMessage({
++          id: `${baseId}_error`,
++          sessionId,
++          timestamp,
++          provider: PROVIDER,
++          kind: 'error',
++          content: errorContent,
++          isError: true,
++        }));
++      }
++    }
++
++    blocks.forEach((block, index) => {
++      const record = readObjectRecord(block);
++      const blockType = readOptionalString(record?.type);
++      const blockId = `${baseId}_${index}`;
++
++      if (blockType === 'text') {
++        const rawText = typeof record?.text === 'string' ? record.text : '';
++        if (messageRole === 'assistant') {
++          if (rawText.trim()) {
++            normalized.push(createNormalizedMessage({
++              id: blockId,
++              sessionId,
++              timestamp,
++              provider: PROVIDER,
++              kind: 'text',
++              role: messageRole,
++              content: rawText,
++            }));
++          }
++          return;
++        }
++
++        // User prompts sent with attachments carry <images_input>/
++        // <files_input> blocks appended by the chat composer; strip them for
++        // display and surface the paths as images/files.
++        const parsedImages = parseImagesInputTag(rawText);
++        const parsedFiles = parseFilesInputTag(parsedImages.text);
++        if (
++          parsedFiles.text.trim()
++          || parsedImages.attachments.length > 0
++          || parsedFiles.attachments.length > 0
++        ) {
++          normalized.push(createNormalizedMessage({
++            id: blockId,
++            sessionId,
++            timestamp,
++            provider: PROVIDER,
++            kind: 'text',
++            role: messageRole,
++            content: parsedFiles.text,
++            images: parsedImages.attachments.length > 0 ? parsedImages.attachments : undefined,
++            files: parsedFiles.attachments.length > 0 ? parsedFiles.attachments : undefined,
++          }));
++        }
++        return;
++      }
++
++      if (blockType === 'thinking') {
++        const content = typeof record?.thinking === 'string' ? record.thinking : '';
++        if (content.trim()) {
++          normalized.push(createNormalizedMessage({
++            id: blockId,
++            sessionId,
++            timestamp,
++            provider: PROVIDER,
++            kind: 'thinking',
++            content,
++          }));
++        }
++        return;
++      }
++
++      if (blockType === 'toolCall') {
++        normalized.push(createNormalizedMessage({
++          id: blockId,
++          sessionId,
++          timestamp,
++          provider: PROVIDER,
++          kind: 'tool_use',
++          toolName: readOptionalString(record?.name) ?? 'Tool',
++          toolInput: record?.arguments ?? {},
++          toolId: readOptionalString(record?.id) ?? blockId,
++        }));
++      }
++    });
++
++    return normalized;
++  }
++
++  if (role === 'toolResult') {
++    const resultText = joinBlockText(message?.content);
++    const toolResult: NonNullable<NormalizedMessage['toolResult']> = {
++      content: resultText,
++    };
++    if (message?.isError !== undefined) {
++      toolResult.isError = message.isError === true;
++    }
++
++    normalized.push(createNormalizedMessage({
++      id: baseId,
++      sessionId,
++      timestamp,
++      provider: PROVIDER,
++      kind: 'tool_result',
++      toolName: readOptionalString(message?.toolName),
++      toolId: readOptionalString(message?.toolCallId) ?? baseId,
++      // The transcript renderer reads the top-level `content` string
++      // (claude tool_result convention); `toolResult` stays for consumers of
++      // the structured payload.
++      content: resultText,
++      toolResult,
++    }));
++  }
++
++  return normalized;
++};
++
++export class PiSessionsProvider implements IProviderSessions {
++  /**
++   * Normalizes live `pi -p --mode json` events into frontend messages.
++   */
++  normalizeMessage(rawMessage: unknown, sessionId: string | null): NormalizedMessage[] {
++    return mapPiEventToMessages(rawMessage, sessionId);
++  }
++
++  /**
++   * Loads pi history from the session's JSONL transcript under
++   * `~/.pi/agent/sessions`.
++   */
++  async fetchHistory(
++    sessionId: string,
++    options: FetchHistoryOptions = {},
++  ): Promise<FetchHistoryResult> {
++    const { limit = null, offset = 0 } = options;
++    // pi keys transcript file names by its provider-native session id, not
++    // the app-facing id this method is addressed with.
++    const providerSessionId = options.providerSessionId ?? sessionId;
++
++    try {
++      const transcriptPath = findPiSessionTranscript(providerSessionId);
++      if (!transcriptPath) {
++        return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
++      }
++
++      // Only the active branch is the conversation: a retried or retreated turn
++      // leaves its abandoned attempt in the same file (see selectActivePiBranch).
++      const entries = selectActivePiBranch(readPiTranscriptEntries(transcriptPath));
++      const normalized = entries.flatMap((entry) => normalizeTranscriptEntry(entry, sessionId));
++
++      // pi's per-event usage is cumulative, so the last assistant entry that
++      // carries one is the run's final accounting.
++      let tokenUsage: AnyRecord | undefined;
++      for (const entry of entries) {
++        const usage = readObjectRecord(readObjectRecord(entry.message)?.usage);
++        if (usage && readOptionalString(readObjectRecord(entry.message)?.role) === 'assistant') {
++          tokenUsage = buildPiTokenUsage(usage) ?? tokenUsage;
++        }
++      }
++
++      const normalizedOffset = Math.max(0, offset);
++      const normalizedLimit = limit === null ? null : Math.max(0, limit);
++      const total = normalized.length;
++      const { page, hasMore } = sliceTailPage(normalized, normalizedLimit, normalizedOffset);
++
++      return {
++        messages: page,
++        total,
++        hasMore,
++        offset: normalizedOffset,
++        limit: normalizedLimit,
++        tokenUsage,
++      };
++    } catch (error) {
++      const message = error instanceof Error ? error.message : String(error);
++      console.warn(`[PiProvider] Failed to load session ${sessionId}:`, message);
++      return { messages: [], total: 0, hasMore: false, offset: 0, limit: null };
++    }
++  }
++}
+diff --git a/server/modules/providers/list/pi/pi-skills.provider.ts b/server/modules/providers/list/pi/pi-skills.provider.ts
+new file mode 100644
+index 00000000..0bd0dad6
+--- /dev/null
++++ b/server/modules/providers/list/pi/pi-skills.provider.ts
+@@ -0,0 +1,110 @@
++import { access, readFile, stat } from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++
++import { SkillsProvider } from '@/modules/providers/shared/skills/skills.provider.js';
++import type { ProviderSkillSource } from '@/shared/types.js';
++import {
++  addUniqueProviderSkillSource,
++  getPiAgentDir,
++  readObjectRecord,
++  readStringArray,
++} from '@/shared/utils.js';
++
++const directoryExists = async (dirPath: string): Promise<boolean> => {
++  try {
++    return (await stat(dirPath)).isDirectory();
++  } catch {
++    return false;
++  }
++};
++
++/**
++ * Reads the extra skill folders pi's `settings.json` points at.
++ *
++ * pi's user-level `~/.pi/agent/settings.json` accepts a `skills` array of
++ * additional directories. Entries are filtered to folders that still exist so a
++ * stale path cannot add an empty source; a missing or malformed settings file
++ * simply contributes nothing.
++ */
++const readPiSettingsSkillDirectories = async (): Promise<string[]> => {
++  try {
++    const settingsPath = path.join(getPiAgentDir(), 'settings.json');
++    await access(settingsPath);
++    const settings = readObjectRecord(JSON.parse(await readFile(settingsPath, 'utf8')));
++    return (readStringArray(settings?.skills) ?? []).filter(
++      (entry) => entry.trim().length > 0,
++    );
++  } catch {
++    return [];
++  }
++};
++
++/**
++ * Skills adapter for pi.
++ *
++ * pi discovers skills in its own user folder, in every folder configured under
++ * `skills` in its settings.json, and in the workspace's `.pi/skills` folder —
++ * plus the Agent Skills compatibility folder `.agents/skills`, which is where
++ * skill packs installed for the `agentskills.io` layout land. A machine's
++ * workspace usually has every skill in that compatibility folder, so omitting
++ * it makes the page show only the few under `.pi/skills`.
++ *
++ * The shared base scans each root for `SKILL.md` and de-duplicates by file path,
++ * so a skill reachable from both roots is listed once. The managed global write
++ * source stays unset, so the inherited addSkills/removeSkill keep rejecting
++ * writes until pi exposes a writable skill home.
++ */
++export class PiSkillsProvider extends SkillsProvider {
++  constructor() {
++    super('pi');
++  }
++
++  protected async getSkillSources(
++    workspacePath: string,
++    hasRequestedWorkspace = true,
++  ): Promise<ProviderSkillSource[]> {
++    const sources: ProviderSkillSource[] = [];
++    const seenRootDirs = new Set<string>();
++    const resolvedWorkspace = path.resolve(workspacePath);
++
++    addUniqueProviderSkillSource(sources, seenRootDirs, {
++      scope: 'user',
++      rootDir: path.join(getPiAgentDir(), 'skills'),
++      commandPrefix: '/',
++    });
++
++    for (const configuredDir of await readPiSettingsSkillDirectories()) {
++      if (!(await directoryExists(configuredDir))) {
++        continue;
++      }
++
++      addUniqueProviderSkillSource(sources, seenRootDirs, {
++        scope: 'user',
++        rootDir: configuredDir,
++        commandPrefix: '/',
++      });
++    }
++
++    // A global listing has no project to scope to; the caller's fallback
++    // workspace is the server's own cwd, whose skills are not the user's.
++    if (!hasRequestedWorkspace) {
++      return sources;
++    }
++
++    addUniqueProviderSkillSource(sources, seenRootDirs, {
++      scope: 'project',
++      rootDir: path.join(resolvedWorkspace, '.pi', 'skills'),
++      commandPrefix: '/',
++    });
++
++    // The Agent Skills compatibility folder pi also reads.
++    addUniqueProviderSkillSource(sources, seenRootDirs, {
++      scope: 'project',
++      rootDir: path.join(resolvedWorkspace, '.agents', 'skills'),
++      commandPrefix: '/',
++    });
++
++    return sources;
++  }
++}
+diff --git a/server/modules/providers/list/pi/pi.provider.ts b/server/modules/providers/list/pi/pi.provider.ts
+new file mode 100644
+index 00000000..ac263882
+--- /dev/null
++++ b/server/modules/providers/list/pi/pi.provider.ts
+@@ -0,0 +1,38 @@
++import { PiProviderAuth } from '@/modules/providers/list/pi/pi-auth.provider.js';
++import { PiMcpProvider } from '@/modules/providers/list/pi/pi-mcp.provider.js';
++import { PiProviderModels } from '@/modules/providers/list/pi/pi-models.provider.js';
++import { piRuntime } from '@/modules/providers/list/pi/pi-runtime.provider.js';
++import { PiSessionSynchronizer } from '@/modules/providers/list/pi/pi-session-synchronizer.provider.js';
++import { PiSessionsProvider } from '@/modules/providers/list/pi/pi-sessions.provider.js';
++import { PiSkillsProvider } from '@/modules/providers/list/pi/pi-skills.provider.js';
++import { AbstractProvider } from '@/modules/providers/shared/base/abstract.provider.js';
++import type {
++  IProviderAuth,
++  IProviderMcp,
++  IProviderModels,
++  IProviderRuntime,
++  IProviderSessionSynchronizer,
++  IProviderSkills,
++  IProviderSessions,
++} from '@/shared/interfaces.js';
++
++/**
++ * Registration for the `pi` provider.
++ *
++ * All seven facets are implemented. pi itself has no fork or MCP support, so
++ * those facets expose no capability beyond what pi's CLI offers: MCP is a
++ * NOT_SUPPORTED stub and session forking stays disabled.
++ */
++export class PiProvider extends AbstractProvider {
++  readonly runtime: IProviderRuntime = piRuntime;
++  readonly models: IProviderModels = new PiProviderModels();
++  readonly mcp: IProviderMcp = new PiMcpProvider();
++  readonly auth: IProviderAuth = new PiProviderAuth();
++  readonly skills: IProviderSkills = new PiSkillsProvider();
++  readonly sessions: IProviderSessions = new PiSessionsProvider();
++  readonly sessionSynchronizer: IProviderSessionSynchronizer = new PiSessionSynchronizer();
++
++  constructor() {
++    super('pi');
++  }
++}

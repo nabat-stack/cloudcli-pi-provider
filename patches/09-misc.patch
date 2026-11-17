@@ -1,0 +1,48 @@
+diff --git a/.gitignore b/.gitignore
+index 557c0c85..ca65143a 100755
+--- a/.gitignore
++++ b/.gitignore
+@@ -148,6 +148,9 @@ cloudcli-sidebar-app-source.tar.gz
+ cloudcli-sidebar.html
+ electron/*.tar.gz
+ 
++# pi provider fork working notes (not for upstream PR)
++docs/pi-notes.md
++docs/pi-e2e-checklist.md
+ # Test fixtures created beside the tests (cleaned up by the tests; kept out of the tree if a run is killed)
+ server/**/tests/read-only-roots-fixture-*/
+ server/**/tests/file-tree-outside-*/
+diff --git a/server/modules/notifications/services/notification-orchestrator.service.js b/server/modules/notifications/services/notification-orchestrator.service.js
+index 70e0f173..c9ff7be5 100644
+--- a/server/modules/notifications/services/notification-orchestrator.service.js
++++ b/server/modules/notifications/services/notification-orchestrator.service.js
+@@ -259,6 +259,14 @@ function notifyUserIfEnabled({ userId, event }) {
+   }
+ }
+ 
++/**
++ * Notifies the user that one provider run stopped or completed.
++ *
++ * Typed via JSDoc so TypeScript provider runtimes can call it while this
++ * module is still JavaScript.
++ *
++ * @param {{ userId?: string | number | null, provider: string, sessionId?: string | null, stopReason?: string, sessionName?: string | null }} options
++ */
+ function notifyRunStopped({ userId, provider, sessionId = null, stopReason = 'completed', sessionName = null }) {
+   notifyUserIfEnabled({
+     userId,
+@@ -296,6 +304,14 @@ function notifyBackgroundWorkCompleted({ userId, provider, sessionId = null, ses
+   });
+ }
+ 
++/**
++ * Notifies the user that one provider run failed.
++ *
++ * Typed via JSDoc so TypeScript provider runtimes can call it while this
++ * module is still JavaScript.
++ *
++ * @param {{ userId?: string | number | null, provider: string, sessionId?: string | null, error?: unknown, sessionName?: string | null }} options
++ */
+ function notifyRunFailed({ userId, provider, sessionId = null, error, sessionName = null }) {
+   const errorMessage = normalizeErrorMessage(error);
+ 

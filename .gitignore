@@ -1,0 +1,4 @@
+# 归档产物之外的临时文件
+*.log
+.DS_Store
+Thumbs.db

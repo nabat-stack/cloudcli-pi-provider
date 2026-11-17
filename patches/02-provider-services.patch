@@ -1,0 +1,306 @@
+diff --git a/server/modules/providers/services/provider-capabilities.service.ts b/server/modules/providers/services/provider-capabilities.service.ts
+index 1f2d5219..1a5e507d 100644
+--- a/server/modules/providers/services/provider-capabilities.service.ts
++++ b/server/modules/providers/services/provider-capabilities.service.ts
+@@ -154,6 +154,31 @@ const PROVIDER_CAPABILITIES: Record<LLMProvider, ProviderCapabilities> = {
+     supportsSteering: false,
+     supportsContextClearing: false,
+   },
++  pi: {
++    provider: 'pi',
++    // pi's CLI has no permission-mode switch: a headless run simply has its
++    // tools enabled, so only the default mode is offered. Image attachments
++    // and abort (SIGTERM) are supported.
++    permissionModes: ['default'],
++    defaultPermissionMode: 'default',
++    supportsImages: true,
++    supportsFiles: false,
++    supportsAbort: true,
++    supportsPermissionRequests: false,
++    supportsTokenUsage: false,
++    supportsEffort: true,
++    // pi's own thinking levels, passed on as `--thinking`.
++    effortLevels: ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
++    supportsMessageEditing: false,
++    // pi can fork a transcript (`--fork`), but this adapter drives one-shot
++    // `--mode json` runs and does not implement the fork facet.
++    supportsSessionForking: false,
++    // The history path answers side questions through the Claude adapter.
++    supportsSideQuestions: false,
++    // Each turn is its own `pi -p` process, so no input stays open to steer.
++    supportsSteering: false,
++    supportsContextClearing: false,
++  },
+ };
+ 
+ /**
+diff --git a/server/modules/providers/services/provider-cli.service.ts b/server/modules/providers/services/provider-cli.service.ts
+index fba6b086..44ba8e03 100644
+--- a/server/modules/providers/services/provider-cli.service.ts
++++ b/server/modules/providers/services/provider-cli.service.ts
+@@ -181,6 +181,7 @@ function getProviderLabel(provider: LLMProvider): string {
+     codex: 'Codex',
+     cursor: 'Cursor CLI',
+     opencode: 'OpenCode',
++    pi: 'Pi',
+   };
+   return labels[provider];
+ }
+diff --git a/server/modules/providers/services/provider-models.service.ts b/server/modules/providers/services/provider-models.service.ts
+index 74a6da78..61267836 100644
+--- a/server/modules/providers/services/provider-models.service.ts
++++ b/server/modules/providers/services/provider-models.service.ts
+@@ -123,6 +123,14 @@ const mergeProviderModels = (
+     // Copied so no caller can mutate the shared capability matrix.
+     EFFORT_LEVELS: [...readCustomModelEffortLevels(provider)],
+     CUSTOM_MODELS_ONLY: customModelsOnly,
++    // Carried through so callers can tell a withheld provider from a removed
++    // model; dropping it here would silently re-enable the mistaken rewrite.
++    ...(predefined.UNREACHABLE_PROVIDERS && predefined.UNREACHABLE_PROVIDERS.length > 0
++      ? { UNREACHABLE_PROVIDERS: [...predefined.UNREACHABLE_PROVIDERS] }
++      : {}),
++    // The exact set the user's "only my models" flag hid, so a caller can tell
++    // "hidden on purpose" from "this provider no longer offers it".
++    ...(listOnlyCustomModels ? { HIDDEN_BUILT_IN_MODELS: [...builtInIds] } : {}),
+   };
+ };
+ 
+@@ -430,6 +438,74 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
+     };
+   };
+ 
++  /**
++   * Where one recorded model stands relative to its provider's catalog:
++   * `listed` when the catalog offers it, `hidden` when the catalog is not the
++   * authority for it (a custom-models-only catalog that hides built-ins), and
++   * `absent` when the provider has no such model at all.
++   */
++  const readCatalogModel = async (
++    provider: LLMProvider,
++    model: string,
++  ): Promise<'listed' | 'hidden' | 'absent'> => {
++    try {
++      const catalog = await getProviderModels(provider);
++      if (catalog.OPTIONS.some((option) => option.value === model)) {
++        return 'listed';
++      }
++      // A model whose provider was withheld from the catalog for failing a
++      // reachability probe is not thereby gone: a probe can fail for a
++      // transient reason (offline, gateway still starting, pi busy). Reporting
++      // it absent would let a caller rewrite the session's recorded model
++      // permanently on the strength of a momentary failure.
++      const modelProvider = model.includes('/') ? model.slice(0, model.indexOf('/')) : null;
++      if (modelProvider && catalog.UNREACHABLE_PROVIDERS?.includes(modelProvider)) {
++        return 'hidden';
++      }
++      // A custom-models-only catalog hides built-ins rather than dropping
++      // them, so a model that is genuinely gone cannot be told apart from one
++      // the user hid — unless the catalog names the exact hidden set. Only that
++      // set is let through; anything else is absent, which keeps an id the
++      // provider already removed from being replayed as merely "hidden".
++      if (catalog.CUSTOM_MODELS_ONLY) {
++        return catalog.HIDDEN_BUILT_IN_MODELS?.includes(model) ? 'hidden' : 'absent';
++      }
++      // Every other catalog is the complete authority, so an id missing from it
++      // is one this provider no longer offers.
++      return 'absent';
++    } catch {
++      // A provider whose catalog cannot be read must not block the session.
++      return 'hidden';
++    }
++  };
++
++  /** One provider's catalog default, or undefined when it has none. */
++  const readCatalogDefault = async (provider: LLMProvider): Promise<string | undefined> => {
++    try {
++      return (await getProviderModels(provider)).DEFAULT || undefined;
++    } catch {
++      return undefined;
++    }
++  };
++
++  /**
++   * Returns the requested model when the provider still offers it, otherwise
++   * the catalog default.
++   *
++   * A browser can keep a selection the catalog has since dropped — a model
++   * from a provider that stopped answering, for instance — and sending it
++   * would fail the run on a model this machine cannot reach.
++   */
++  const settleRequestedModel = async (
++    provider: LLMProvider,
++    requestedModel: string,
++  ): Promise<string | undefined> => {
++    if (requestedModel && (await readCatalogModel(provider, requestedModel)) !== 'absent') {
++      return requestedModel;
++    }
++    return (await readCatalogDefault(provider)) ?? (requestedModel || undefined);
++  };
++
+   /**
+    * Answers "which model is this session using?" for every display surface.
+    *
+@@ -450,7 +526,14 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
+ 
+     if (normalizedSessionId) {
+       const recordedSelection = readRecordedSessionSelection(normalizedSessionId);
+-      if (recordedSelection?.model) {
++      // A recorded model outlives the catalog it came from whenever that
++      // catalog is discovered at runtime: pi reads its CLI, so a machine that
++      // changes gateways leaves rows pointing at models that no longer answer.
++      // Answering with such a row would make every display surface show a model
++      // the next run cannot use, so it is only honoured while the catalog still
++      // offers it (or while it is merely hidden by a custom-models-only list).
++      if (recordedSelection?.model
++        && (await readCatalogModel(provider, recordedSelection.model)) !== 'absent') {
+         return {
+           provider,
+           sessionId: normalizedSessionId,
+@@ -467,7 +550,12 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
+       // Adapters answer with their own built-in default when they know nothing
+       // about the session. That value, not the merged default (a custom model
+       // while only custom models are listed), is what means "no answer".
+-      if (resolvedProviderModel && resolvedProviderModel !== predefined.DEFAULT) {
++      // A provider-supplied model is checked against the catalog for the same
++      // reason a recorded one is: an adapter can echo a model from an older
++      // listing that the live catalog has since dropped.
++      if (resolvedProviderModel
++        && resolvedProviderModel !== predefined.DEFAULT
++        && (await readCatalogModel(provider, resolvedProviderModel)) !== 'absent') {
+         return {
+           provider,
+           sessionId: normalizedSessionId,
+@@ -480,7 +568,8 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
+       return {
+         provider,
+         sessionId: normalizedSessionId,
+-        model: normalizedRequestedModel || providerCatalog.DEFAULT,
++        model: (await settleRequestedModel(provider, normalizedRequestedModel))
++          || providerCatalog.DEFAULT,
+         effort: recordedSelection?.effort ?? null,
+         source: normalizedRequestedModel ? 'session' : 'default',
+       };
+@@ -490,7 +579,8 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
+       return {
+         provider,
+         sessionId: null,
+-        model: normalizedRequestedModel,
++        model: (await settleRequestedModel(provider, normalizedRequestedModel))
++          || normalizedRequestedModel,
+         effort: null,
+         source: 'session',
+       };
+@@ -511,23 +601,47 @@ export const createProviderModelsService = (dependencies: ProviderModelsServiceD
+    *
+    * Provider-global state is deliberately ignored because it must never
+    * override the model explicitly selected in the composer.
++   *
++   * The session's recorded model is only honoured while the provider's current
++   * catalog still lists it. A row can outlive its model: a provider whose
++   * catalog is discovered at runtime (pi reads its CLI, so a machine's own
++   * gateways define the list) keeps whatever an older build happened to
++   * record, and replaying that would fail the resumed run on a model this
++   * machine cannot reach.
+    */
+   const resolveResumeModel = async (
+     provider: LLMProvider,
+     sessionId: string | undefined,
+     requestedModel?: string | null,
+   ): Promise<string | undefined> => {
+-    void provider;
+     const normalizedRequestedModel = typeof requestedModel === 'string' ? requestedModel.trim() : '';
+     const normalizedSessionId = sessionId?.trim();
+     if (!normalizedSessionId) {
+       return normalizedRequestedModel || undefined;
+     }
+ 
+-    const recordedModel = readRecordedSessionSelection(normalizedSessionId)?.model;
+-    return recordedModel || normalizedRequestedModel || undefined;
+-  };
++    const recordedModel = readRecordedSessionSelection(normalizedSessionId)?.model ?? undefined;
++    if (!recordedModel) {
++      // Nothing recorded, but the composer can still name a model the
++      // provider no longer offers — a browser holding a stale selection.
++      return await settleRequestedModel(provider, normalizedRequestedModel);
++    }
+ 
++    // The recorded model wins while the provider's catalog still lists it, or
++    // while it is merely hidden from the catalog (a custom-models-only
++    // selection). Only a model the catalog never had is treated as stale.
++    const catalogModel = await readCatalogModel(provider, recordedModel);
++    if (catalogModel !== 'absent') {
++      return recordedModel;
++    }
++
++    const replacement = await settleRequestedModel(provider, normalizedRequestedModel);
++    if (replacement) {
++      // Repaired, not merely ignored, so the next resume skips this lookup.
++      sessions.setSessionModel(normalizedSessionId, replacement);
++    }
++    return replacement || undefined;
++  };
+   return {
+     getProviderModels,
+     setCustomModelsOnly,
+diff --git a/server/modules/providers/services/provider-token-usage.service.ts b/server/modules/providers/services/provider-token-usage.service.ts
+index 5d7e1035..5a97b832 100644
+--- a/server/modules/providers/services/provider-token-usage.service.ts
++++ b/server/modules/providers/services/provider-token-usage.service.ts
+@@ -456,6 +456,22 @@ export function createProviderTokenUsageService(
+         };
+       }
+ 
++      // Pi already carries cumulative usage in its live runtime events, and
++      // reading historical usage back is the sessions API's job (it parses the
++      // JSONL transcripts), so this endpoint answers with an explicit
++      // unsupported result the same way Cursor does.
++      if (session.provider === 'pi') {
++        return {
++          used: 0,
++          total: 0,
++          inputTokens: 0,
++          outputTokens: 0,
++          breakdown: { input: 0, output: 0 },
++          unsupported: true,
++          message: 'Token usage tracking not available for Pi sessions',
++        };
++      }
++
+       if (session.provider === 'opencode') {
+         const databasePath = dependencies.getOpenCodeDatabasePath();
+         if (!dependencies.fileExists(databasePath)) {
+diff --git a/server/modules/providers/services/session-synchronizer.service.ts b/server/modules/providers/services/session-synchronizer.service.ts
+index 4e0af82a..ed53103e 100644
+--- a/server/modules/providers/services/session-synchronizer.service.ts
++++ b/server/modules/providers/services/session-synchronizer.service.ts
+@@ -84,6 +84,7 @@ async function runSessionSynchronization(): Promise<SessionSynchronizeResult> {
+     codex: 0,
+     cursor: 0,
+     opencode: 0,
++    pi: 0,
+   };
+   const failures: string[] = [];
+ 
+diff --git a/server/modules/providers/services/sessions-watcher.service.ts b/server/modules/providers/services/sessions-watcher.service.ts
+index 2f9e5a9e..8c5536e7 100644
+--- a/server/modules/providers/services/sessions-watcher.service.ts
++++ b/server/modules/providers/services/sessions-watcher.service.ts
+@@ -6,6 +6,7 @@ import chokidar, { type FSWatcher } from 'chokidar';
+ 
+ import { sessionSynchronizerService } from '@/modules/providers/services/session-synchronizer.service.js';
+ import { broadcastSessionUpsertedBatch } from '@/modules/websocket/index.js';
++import { getPiSessionDir } from '@/shared/utils.js';
+ import type { LLMProvider } from '@/shared/types.js';
+ 
+ type WatcherEventType = 'add' | 'change';
+@@ -27,6 +28,10 @@ const PROVIDER_WATCH_PATHS: Array<{ provider: LLMProvider; rootPath: string }> =
+     provider: 'opencode',
+     rootPath: path.join(os.homedir(), '.local', 'share', 'opencode'),
+   },
++  {
++    provider: 'pi',
++    rootPath: getPiSessionDir(),
++  },
+ ];
+ 
+ /**

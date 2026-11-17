@@ -1,0 +1,98 @@
+diff --git a/server/modules/providers/provider.registry.ts b/server/modules/providers/provider.registry.ts
+index 8c333fcb..9a87df97 100644
+--- a/server/modules/providers/provider.registry.ts
++++ b/server/modules/providers/provider.registry.ts
+@@ -2,6 +2,7 @@ import { ClaudeProvider } from '@/modules/providers/list/claude/claude.provider.
+ import { CodexProvider } from '@/modules/providers/list/codex/codex.provider.js';
+ import { CursorProvider } from '@/modules/providers/list/cursor/cursor.provider.js';
+ import { OpenCodeProvider } from '@/modules/providers/list/opencode/opencode.provider.js';
++import { PiProvider } from '@/modules/providers/list/pi/pi.provider.js';
+ import type { IProvider } from '@/shared/interfaces.js';
+ import type { LLMProvider } from '@/shared/types.js';
+ import { AppError } from '@/shared/utils.js';
+@@ -11,6 +12,7 @@ const providers: Record<LLMProvider, IProvider> = {
+   codex: new CodexProvider(),
+   cursor: new CursorProvider(),
+   opencode: new OpenCodeProvider(),
++  pi: new PiProvider(),
+ };
+ 
+ /**
+diff --git a/server/modules/providers/provider.routes.ts b/server/modules/providers/provider.routes.ts
+index a004c833..c9da45b5 100644
+--- a/server/modules/providers/provider.routes.ts
++++ b/server/modules/providers/provider.routes.ts
+@@ -332,6 +332,7 @@ const parseProvider = (value: unknown): LLMProvider => {
+     || normalized === 'codex'
+     || normalized === 'cursor'
+     || normalized === 'opencode'
++    || normalized === 'pi'
+   ) {
+     return normalized;
+   }
+diff --git a/server/modules/providers/shared/skills/skills.provider.ts b/server/modules/providers/shared/skills/skills.provider.ts
+index 032aea30..0d01b2ae 100644
+--- a/server/modules/providers/shared/skills/skills.provider.ts
++++ b/server/modules/providers/shared/skills/skills.provider.ts
+@@ -1,5 +1,5 @@
+ import path from 'node:path';
+-import { mkdir, rm, stat, writeFile } from 'node:fs/promises';
++import { mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+ 
+ import type { IProviderSkills } from '@/shared/interfaces.js';
+ import type {
+@@ -93,21 +93,39 @@ export abstract class SkillsProvider implements IProviderSkills {
+   }
+ 
+   async listSkills(options?: ProviderSkillListOptions): Promise<ProviderSkill[]> {
+-    const workspacePath = resolveWorkspacePath(options?.workspacePath);
+-    const sources = await this.getSkillSources(workspacePath);
++    // The skills page asks once without a workspace for the global view and
++    // once per project for the scoped view. Without a requested path there is
++    // no project to scope to: falling back to the server's own cwd would list
++    // the CloudCLI checkout's skills as if they belonged to the user.
++    const requestedWorkspace = options?.workspacePath;
++    const workspacePath = resolveWorkspacePath(requestedWorkspace);
++    const sources = await this.getSkillSources(workspacePath, Boolean(requestedWorkspace));
+     const skills: ProviderSkill[] = [];
++    // A skill file can be reachable from more than one root — the workspace's
++    // own folder plus an `.agents/skills` compatibility folder, say — and a
++    // provider-specific root may sit inside a shared one. One file is one
++    // skill, so the first root that offers it wins and later roots skip it.
++    // The key is the real path: two roots can be linked to the same directory,
++    // and `path.resolve` alone would treat their copies as different files.
++    const seenSkillPaths = new Set<string>();
+ 
+     for (const source of sources) {
+       const skillFiles = await findProviderSkillMarkdownFiles(source.rootDir, {
+         recursive: source.recursive,
+       });
+       for (const skillPath of skillFiles) {
++        const identity = await realpath(skillPath).catch(() => path.resolve(skillPath));
++        if (seenSkillPaths.has(identity)) {
++          continue;
++        }
++
+         try {
+           const definition = await readProviderSkillMarkdownDefinition(skillPath);
+           const command = source.commandForSkill
+             ? source.commandForSkill(definition.name)
+             : `${source.commandPrefix ?? '/'}${definition.name}`;
+ 
++          seenSkillPaths.add(identity);
+           skills.push({
+             provider: this.provider,
+             name: definition.name,
+@@ -279,7 +297,11 @@ export abstract class SkillsProvider implements IProviderSkills {
+     return { removed, provider: this.provider, directoryName };
+   }
+ 
+-  protected abstract getSkillSources(workspacePath: string): Promise<ProviderSkillSource[]>;
++  protected abstract getSkillSources(
++    workspacePath: string,
++    /** Whether the caller named a workspace, rather than falling back to the server's cwd. */
++    hasRequestedWorkspace?: boolean,
++  ): Promise<ProviderSkillSource[]>;
+ 
+   protected async getGlobalSkillSource(): Promise<ProviderSkillSource | null> {
+     return null;

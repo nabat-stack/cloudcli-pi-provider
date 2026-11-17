@@ -1,0 +1,671 @@
+diff --git a/src/modules/i18n/locales/en/chat.json b/src/modules/i18n/locales/en/chat.json
+index 749650ab..06647375 100644
+--- a/src/modules/i18n/locales/en/chat.json
++++ b/src/modules/i18n/locales/en/chat.json
+@@ -18,7 +18,8 @@
+     "claude": "Claude",
+     "cursor": "Cursor",
+     "codex": "Codex",
+-    "opencode": "OpenCode"
++    "opencode": "OpenCode",
++    "pi": "Pi"
+   },
+   "tools": {
+     "settings": "Tool Settings",
+@@ -227,6 +228,7 @@
+       "cursor": "Ready to use Cursor with {{model}}. Start typing your message below.",
+       "codex": "Ready to use Codex with {{model}}. Start typing your message below.",
+       "opencode": "Ready to use OpenCode with {{model}}. Start typing your message below.",
++      "pi": "Ready to use Pi with {{model}}. Start typing your message below.",
+       "default": "Select a provider above to begin"
+     },
+     "pressToSearch": "Press <kbd>{{shortcut}}</kbd> to search sessions, files, and commits",
+diff --git a/src/modules/i18n/locales/en/common.json b/src/modules/i18n/locales/en/common.json
+index 74fa18ef..321aa2da 100644
+--- a/src/modules/i18n/locales/en/common.json
++++ b/src/modules/i18n/locales/en/common.json
+@@ -352,6 +352,7 @@
+     "unknownProvider": "Unknown",
+     "browseFolders": "Browse folders",
+     "closeLoginModal": "Close login modal",
++    "piSetupHint": "Pi has no login command: credentials come from environment variables or ~/.pi/agent/models.json. The pi CLI below is for setup and verification.",
+     "pluginLoadFailed": "Plugin failed to load: {{error}}"
+   },
+   "workflow": {
+diff --git a/src/modules/i18n/locales/en/settings.json b/src/modules/i18n/locales/en/settings.json
+index d66cbfff..14fd832a 100644
+--- a/src/modules/i18n/locales/en/settings.json
++++ b/src/modules/i18n/locales/en/settings.json
+@@ -456,6 +456,24 @@
+       },
+       "opencode": {
+         "description": "OpenCode CLI assistant"
++      },
++      "pi": {
++        "description": "Pi coding agent CLI"
++      }
++    },
++    "pi": {
++      "setup": {
++        "title": "Set up Pi",
++        "installTitle": "Install Pi",
++        "description": "Pi has no login command: model credentials come from environment variables or its own models.json. Opening the pi CLI lets you finish the setup and verify it.",
++        "button": "Open pi CLI",
++        "installCommand": "npm install -g @earendil-works/pi-coding-agent",
++        "modelsHint": "Configure model providers in ~/.pi/agent/models.json or through environment variables such as $ANTHROPIC_API_KEY."
++      },
++      "authMethod": {
++        "label": "Credential source",
++        "env": "Environment variable",
++        "oauth": "pi auth store"
+       }
+     },
+     "connectionStatus": "Connection Status",
+@@ -757,6 +775,7 @@
+   },
+   "skillsPage": {
+     "description": "Manage {{provider}} skills from local files, complete folders, and project-aware locations.",
++    "readOnlyDescription": "Showing the skills {{provider}} discovers on disk. To add a skill, place a SKILL.md folder in one of {{provider}}'s skill directories, then refresh.",
+     "searchPlaceholder": "Search skills...",
+     "searchAriaLabel": "Search skills",
+     "clearSearch": "Clear skill search",
+@@ -774,6 +793,7 @@
+     "loading": "Loading {{provider}} skills…",
+     "emptyTitle": "No skills discovered yet",
+     "emptyDescription": "Add a global skill above or create project-specific skill folders in your workspace.",
++    "emptyReadOnlyDescription": "No skills discovered yet. Add a SKILL.md folder to a directory {{provider}} scans, for example:",
+     "noMatchTitle": "No matching skills",
+     "noMatchDescription": "Try a different command, name, scope, project, or source path.",
+     "count_one": "{{count}} skill",
+diff --git a/src/modules/mcp/McpServers.tsx b/src/modules/mcp/McpServers.tsx
+index e920820e..696c2a40 100644
+--- a/src/modules/mcp/McpServers.tsx
++++ b/src/modules/mcp/McpServers.tsx
+@@ -21,6 +21,7 @@ const MCP_PROVIDER_BUTTON_CLASSES: Record<McpProvider, string> = {
+   cursor: 'bg-primary text-primary-foreground hover:bg-primary/90',
+   codex: 'bg-primary text-primary-foreground hover:bg-primary/90',
+   opencode: 'bg-primary text-primary-foreground hover:bg-primary/90',
++  pi: 'bg-primary text-primary-foreground hover:bg-primary/90',
+ };
+ 
+ const getTransportIcon = (transport: string | undefined) => {
+diff --git a/src/modules/onboarding/AgentConnectionsStep.tsx b/src/modules/onboarding/AgentConnectionsStep.tsx
+index 2871dcb5..525014a4 100644
+--- a/src/modules/onboarding/AgentConnectionsStep.tsx
++++ b/src/modules/onboarding/AgentConnectionsStep.tsx
+@@ -37,6 +37,13 @@ const providerCards = [
+     iconContainerClassName: 'bg-zinc-100 dark:bg-zinc-800',
+     loginButtonClassName: 'bg-zinc-800 hover:bg-zinc-900 dark:bg-zinc-700 dark:hover:bg-zinc-600',
+   },
++  {
++    provider: 'pi' as const,
++    title: 'Pi',
++    connectedClassName: 'bg-zinc-100 dark:bg-zinc-800/50 border-zinc-300 dark:border-zinc-600',
++    iconContainerClassName: 'bg-zinc-100 dark:bg-zinc-800',
++    loginButtonClassName: 'bg-zinc-800 hover:bg-zinc-900 dark:bg-zinc-700 dark:hover:bg-zinc-600',
++  },
+ ];
+ 
+ /** Rendered by Onboarding as its second step, listing every CLI provider the user can log into. */
+diff --git a/src/modules/provider-auth/ProviderLoginModal.tsx b/src/modules/provider-auth/ProviderLoginModal.tsx
+index 7d8186f1..e5051432 100644
+--- a/src/modules/provider-auth/ProviderLoginModal.tsx
++++ b/src/modules/provider-auth/ProviderLoginModal.tsx
+@@ -59,6 +59,12 @@ const getProviderCommand = ({
+     return 'opencode auth login';
+   }
+ 
++  // Pi ships no login subcommand — credentials come from its own models.json
++  // or environment variables — so open its TUI and let the user configure it.
++  if (provider === 'pi') {
++    return 'pi';
++  }
++
+   return 'claude --dangerously-skip-permissions /login';
+ };
+ 
+@@ -67,6 +73,7 @@ const getProviderTitle = (provider: LLMProvider) => {
+   if (provider === 'cursor') return 'Cursor CLI Login';
+   if (provider === 'codex') return 'Codex CLI Login';
+   if (provider === 'opencode') return 'OpenCode CLI Login';
++  if (provider === 'pi') return 'Pi CLI Setup';
+   return 'Claude CLI Login';
+ };
+ 
+@@ -87,6 +94,16 @@ export default function ProviderLoginModal({
+   const command = getProviderCommand({ provider, customCommand, isAuthenticated });
+   const title = getProviderTitle(provider);
+ 
++  // Only Pi needs guidance here: its "login" is really a setup step, so the
++  // shell below would otherwise look like it should be asking for credentials.
++  const hint =
++    provider === 'pi'
++      ? t('common:misc.piSetupHint', {
++          defaultValue:
++            'Pi has no login command: credentials come from environment variables or ~/.pi/agent/models.json. The pi CLI below is for setup and verification.',
++        })
++      : null;
++
+   const handleComplete = (exitCode: number) => {
+     onComplete?.(exitCode);
+     // Keep the modal open so users can read terminal output before closing.
+@@ -98,8 +115,11 @@ export default function ProviderLoginModal({
+       className="fixed inset-0 z-[9999] flex items-center justify-center bg-black bg-opacity-50 max-md:items-stretch max-md:justify-stretch"
+     >
+       <div className="flex h-3/4 w-full max-w-4xl flex-col rounded-lg bg-white shadow-xl dark:bg-gray-800 max-md:m-0 max-md:h-full max-md:max-w-none max-md:rounded-none md:m-4 md:h-3/4 md:max-w-4xl md:rounded-lg">
+-        <div className="flex items-center justify-between border-b border-gray-200 p-4 dark:border-gray-700">
+-          <h3 className="text-lg font-semibold text-gray-900 dark:text-white">{title}</h3>
++        <div className="flex items-start justify-between gap-4 border-b border-gray-200 p-4 dark:border-gray-700">
++          <div className="min-w-0">
++            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">{title}</h3>
++            {hint && <p className="mt-1 text-xs text-muted-foreground">{hint}</p>}
++          </div>
+           <button
+             onClick={onClose}
+             className="text-gray-400 transition-colors hover:text-gray-600 dark:hover:text-gray-300"
+diff --git a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
+index 505f0d15..83fc6c21 100644
+--- a/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
++++ b/src/modules/provider-auth/hooks/useProviderAuthStatus.ts
+@@ -8,16 +8,18 @@ import type {
+   ProviderAuthSubscriptionOverride,
+ } from '@/shared/types';
+ 
+-const CLI_PROVIDERS: LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode'];
++const CLI_PROVIDERS: LLMProvider[] = ['claude', 'cursor', 'codex', 'opencode', 'pi'];
+ 
+ const createInitialProviderAuthStatusMap = (loading = true): ProviderAuthStatusMap => ({
+   claude: { authenticated: false, email: null, method: null, error: null, loading },
+   cursor: { authenticated: false, email: null, method: null, error: null, loading },
+   codex: { authenticated: false, email: null, method: null, error: null, loading },
+   opencode: { authenticated: false, email: null, method: null, error: null, loading },
++  pi: { authenticated: false, email: null, method: null, error: null, loading },
+ });
+ 
+ type ProviderAuthStatusPayload = {
++  installed?: boolean;
+   authenticated?: boolean;
+   email?: string | null;
+   method?: string | null;
+@@ -42,6 +44,7 @@ const toProviderAuthStatus = (
+   payload: ProviderAuthStatusPayload,
+   fallbackError: string | null = null,
+ ): ProviderAuthStatus => ({
++  installed: payload.installed,
+   authenticated: Boolean(payload.authenticated),
+   email: payload.email ?? null,
+   method: payload.method ?? null,
+diff --git a/src/modules/settings/tabs/agents-settings/AgentsSettingsTab.tsx b/src/modules/settings/tabs/agents-settings/AgentsSettingsTab.tsx
+index e9d2afb7..2bbb503e 100644
+--- a/src/modules/settings/tabs/agents-settings/AgentsSettingsTab.tsx
++++ b/src/modules/settings/tabs/agents-settings/AgentsSettingsTab.tsx
+@@ -34,13 +34,17 @@ export default function AgentsSettingsTab({
+   const [selectedAgent, setSelectedAgent] = useState<AgentProvider>('claude');
+   const [selectedCategory, setSelectedCategory] = useState<AgentCategory>('account');
+   const visibleCategories = useMemo<AgentCategory[]>(() => (
++    // OpenCode hides its own skills folder from this tab; Pi has neither
++    // permissions nor MCP support, so it only offers account and skills.
+     selectedAgent === 'opencode'
+       ? ['account', 'permissions', 'mcp']
+-      : ['account', 'permissions', 'mcp', 'skills']
++      : selectedAgent === 'pi'
++        ? ['account', 'skills']
++        : ['account', 'permissions', 'mcp', 'skills']
+   ), [selectedAgent]);
+ 
+   const visibleAgents = useMemo<AgentProvider[]>(() => {
+-    return ['claude', 'cursor', 'codex', 'opencode'];
++    return ['claude', 'cursor', 'codex', 'opencode', 'pi'];
+   }, []);
+ 
+   const agentContextById = useMemo<AgentContextByProvider>(() => ({
+@@ -60,12 +64,17 @@ export default function AgentsSettingsTab({
+       authStatus: providerAuthStatus.opencode,
+       onLogin: () => onProviderLogin('opencode'),
+     },
++    pi: {
++      authStatus: providerAuthStatus.pi,
++      onLogin: () => onProviderLogin('pi'),
++    },
+   }), [
+     onProviderLogin,
+     providerAuthStatus.claude,
+     providerAuthStatus.codex,
+     providerAuthStatus.cursor,
+     providerAuthStatus.opencode,
++    providerAuthStatus.pi,
+   ]);
+ 
+   useEffect(() => {
+diff --git a/src/modules/settings/tabs/agents-settings/sections/AgentSelectorSection.tsx b/src/modules/settings/tabs/agents-settings/sections/AgentSelectorSection.tsx
+index 079a067f..baa5018c 100644
+--- a/src/modules/settings/tabs/agents-settings/sections/AgentSelectorSection.tsx
++++ b/src/modules/settings/tabs/agents-settings/sections/AgentSelectorSection.tsx
+@@ -13,6 +13,7 @@ const AGENT_NAMES: Record<AgentProvider, string> = {
+   cursor: 'Cursor',
+   codex: 'Codex',
+   opencode: 'OpenCode',
++  pi: 'Pi',
+ };
+ 
+ /** Rendered by AgentsSettingsTab to pick which agent provider the tab is configuring. */
+@@ -29,7 +30,8 @@ export default function AgentSelectorSection({
+           const dotColor =
+             agent === 'claude' ? 'bg-blue-500' :
+             agent === 'cursor' ? 'bg-purple-500' :
+-            agent === 'opencode' ? 'bg-zinc-500' : 'bg-foreground/60';
++            agent === 'opencode' ? 'bg-zinc-500' :
++            agent === 'pi' ? 'bg-gray-500' : 'bg-foreground/60';
+ 
+           return (
+             <Pill
+diff --git a/src/modules/settings/tabs/agents-settings/sections/content/AccountContent.tsx b/src/modules/settings/tabs/agents-settings/sections/content/AccountContent.tsx
+index 8b5d7cde..430fce8f 100644
+--- a/src/modules/settings/tabs/agents-settings/sections/content/AccountContent.tsx
++++ b/src/modules/settings/tabs/agents-settings/sections/content/AccountContent.tsx
+@@ -1,4 +1,4 @@
+-import { AlertTriangle, LogIn } from 'lucide-react';
++import { AlertTriangle, LogIn, Terminal } from 'lucide-react';
+ import { useTranslation } from 'react-i18next';
+ 
+ import ProviderCliVersion from '@/modules/settings/tabs/agents-settings/sections/content/ProviderCliVersion';
+@@ -55,6 +55,15 @@ const agentConfig: Record<AgentProvider, AgentVisualConfig> = {
+     subtextClass: 'text-zinc-700 dark:text-zinc-300',
+     buttonClass: 'bg-zinc-900 hover:bg-zinc-800 active:bg-zinc-950 dark:bg-zinc-700 dark:hover:bg-zinc-600',
+   },
++  pi: {
++    name: 'Pi',
++    description: 'Pi coding agent CLI',
++    bgClass: 'bg-muted/50',
++    borderClass: 'border-gray-300 dark:border-gray-600',
++    textClass: 'text-gray-900 dark:text-gray-100',
++    subtextClass: 'text-gray-700 dark:text-gray-300',
++    buttonClass: 'bg-gray-800 hover:bg-gray-900 active:bg-gray-950 dark:bg-gray-700 dark:hover:bg-gray-600 dark:active:bg-gray-500',
++  },
+ };
+ 
+ type SubscriptionOverrideNoticeProps = {
+@@ -161,29 +170,86 @@ export default function AccountContent({ agent, authStatus, onLogin }: AccountCo
+             subtextClass={config.subtextClass}
+           />
+ 
+-          {authStatus.method !== 'api_key' && (
+-            <div className="border-t border-border/50 pt-4">
+-              <div className="flex items-center justify-between">
+-                <div>
+-                  <div className={`font-medium ${config.textClass}`}>
+-                    {authStatus.authenticated ? t('agents.login.reAuthenticate') : t('agents.login.title')}
++          {agent === 'pi' ? (
++            <>
++              {/*
++                Pi has no account to sign into: credentials are a local auth
++                store or an API key from the environment, so this panel walks
++                through install/configure instead of offering a login.
++              */}
++              {authStatus.authenticated && authStatus.method && (
++                <div className="border-t border-border/50 pt-4">
++                  <div className="flex items-center gap-2">
++                    <div className={`text-sm font-medium ${config.textClass}`}>
++                      {t('agents.pi.authMethod.label')}
++                    </div>
++                    <Badge variant="secondary" className="bg-muted">
++                      {authStatus.method === 'oauth'
++                        ? t('agents.pi.authMethod.oauth')
++                        : t('agents.pi.authMethod.env')}
++                    </Badge>
+                   </div>
+-                  <div className={`text-sm ${config.subtextClass}`}>
+-                    {authStatus.authenticated
+-                      ? t('agents.login.reAuthDescription')
+-                      : t('agents.login.description', { agent: config.name })}
++                </div>
++              )}
++
++              <div className="border-t border-border/50 pt-4">
++                <div className="flex items-start justify-between gap-4">
++                  <div className="min-w-0">
++                    <div className={`font-medium ${config.textClass}`}>
++                      {authStatus.installed === false
++                        ? t('agents.pi.setup.installTitle')
++                        : t('agents.pi.setup.title')}
++                    </div>
++                    <div className={`text-sm ${config.subtextClass}`}>
++                      {t('agents.pi.setup.description')}
++                    </div>
++                  </div>
++                  <Button
++                    onClick={onLogin}
++                    className={`${config.buttonClass} text-white`}
++                    size="sm"
++                  >
++                    <Terminal className="mr-2 h-4 w-4" />
++                    {t('agents.pi.setup.button')}
++                  </Button>
++                </div>
++                {authStatus.installed === false && (
++                  <div className="mt-3 rounded-md border border-border/60 bg-muted/30 px-3 py-2">
++                    <code className="block whitespace-normal break-all text-xs text-foreground">
++                      {t('agents.pi.setup.installCommand')}
++                    </code>
++                  </div>
++                )}
++                <div className={`mt-3 text-sm ${config.subtextClass}`}>
++                  {t('agents.pi.setup.modelsHint')}
++                </div>
++              </div>
++            </>
++          ) : (
++            authStatus.method !== 'api_key' && (
++              <div className="border-t border-border/50 pt-4">
++                <div className="flex items-center justify-between">
++                  <div>
++                    <div className={`font-medium ${config.textClass}`}>
++                      {authStatus.authenticated ? t('agents.login.reAuthenticate') : t('agents.login.title')}
++                    </div>
++                    <div className={`text-sm ${config.subtextClass}`}>
++                      {authStatus.authenticated
++                        ? t('agents.login.reAuthDescription')
++                        : t('agents.login.description', { agent: config.name })}
++                    </div>
+                   </div>
++                  <Button
++                    onClick={onLogin}
++                    className={`${config.buttonClass} text-white`}
++                    size="sm"
++                  >
++                    <LogIn className="mr-2 h-4 w-4" />
++                    {authStatus.authenticated ? t('agents.login.reLoginButton') : t('agents.login.button')}
++                  </Button>
+                 </div>
+-                <Button
+-                  onClick={onLogin}
+-                  className={`${config.buttonClass} text-white`}
+-                  size="sm"
+-                >
+-                  <LogIn className="mr-2 h-4 w-4" />
+-                  {authStatus.authenticated ? t('agents.login.reLoginButton') : t('agents.login.button')}
+-                </Button>
+               </div>
+-            </div>
++            )
+           )}
+ 
+           {authStatus.error && (
+diff --git a/src/modules/settings/tests/accountContentPiSetup.test.tsx b/src/modules/settings/tests/accountContentPiSetup.test.tsx
+new file mode 100644
+index 00000000..8a6afb65
+--- /dev/null
++++ b/src/modules/settings/tests/accountContentPiSetup.test.tsx
+@@ -0,0 +1,93 @@
++import assert from 'node:assert/strict';
++import { readFileSync } from 'node:fs';
++import path from 'node:path';
++
++import { render } from '@testing-library/react';
++import React from 'react';
++import { test, vi } from 'vitest';
++
++import type { ProviderAuthStatus } from '@/shared/types';
++
++/**
++ * Pi has no login command, so its account panel must walk the user through
++ * install/configure (and show the credential source) instead of the generic
++ * sign-in block the other providers get.
++ */
++
++vi.mock('react-i18next', () => ({
++  useTranslation: () => ({
++    // Keys are asserted verbatim so this test stays independent of locale files.
++    t: (key: string) => key,
++  }),
++}));
++
++const { default: AccountContent } = await import('@/modules/settings/tabs/agents-settings/sections/content/AccountContent');
++
++const makeStatus = (overrides: Partial<ProviderAuthStatus> = {}): ProviderAuthStatus => ({
++  authenticated: false,
++  email: null,
++  method: null,
++  error: null,
++  loading: false,
++  ...overrides,
++});
++
++const onLogin = vi.fn();
++
++test('an uninstalled pi shows the install command instead of a login prompt', () => {
++  const { container } = render(
++    <AccountContent
++      agent="pi"
++      authStatus={makeStatus({ installed: false })}
++      onLogin={onLogin}
++    />,
++  );
++
++  const text = container.textContent ?? '';
++  assert.equal(text.includes('agents.pi.setup.installTitle'), true);
++  assert.equal(text.includes('agents.pi.setup.installCommand'), true);
++  assert.equal(text.includes('agents.login.title'), false);
++});
++
++test('an authenticated pi reports its credential source', () => {
++  const { container } = render(
++    <AccountContent
++      agent="pi"
++      authStatus={makeStatus({ authenticated: true, method: 'env' })}
++      onLogin={onLogin}
++    />,
++  );
++
++  const text = container.textContent ?? '';
++  assert.equal(text.includes('agents.pi.authMethod.label'), true);
++  assert.equal(text.includes('agents.pi.authMethod.env'), true);
++  assert.equal(text.includes('agents.login.title'), false);
++});
++
++test('other providers keep the generic sign-in block', () => {
++  const { container } = render(
++    <AccountContent
++      agent="claude"
++      authStatus={makeStatus({ installed: false })}
++      onLogin={onLogin}
++    />,
++  );
++
++  const text = container.textContent ?? '';
++  assert.equal(text.includes('agents.login.title'), true);
++  assert.equal(text.includes('agents.pi.setup.'), false);
++});
++
++test('the en locale points the pi install guidance at the public package', () => {
++  const settings = JSON.parse(
++    readFileSync(
++      path.join(process.cwd(), 'src/modules/i18n/locales/en/settings.json'),
++      'utf8',
++    ),
++  ) as { agents: { pi: { setup: Record<string, string> } } };
++
++  assert.equal(
++    settings.agents.pi.setup.installCommand,
++    'npm install -g @earendil-works/pi-coding-agent',
++  );
++});
+diff --git a/src/modules/sidebar/utils/sidebarProjectFormatting.ts b/src/modules/sidebar/utils/sidebarProjectFormatting.ts
+index e72924ed..55c34fe4 100644
+--- a/src/modules/sidebar/utils/sidebarProjectFormatting.ts
++++ b/src/modules/sidebar/utils/sidebarProjectFormatting.ts
+@@ -214,4 +214,5 @@ export const PROVIDER_LABELS: Record<LLMProvider, string> = {
+   codex: 'Codex',
+   cursor: 'Cursor',
+   opencode: 'OpenCode',
++  pi: 'Pi',
+ };
+diff --git a/src/modules/skills/ProviderSkills.tsx b/src/modules/skills/ProviderSkills.tsx
+index 97459267..4999ba19 100644
+--- a/src/modules/skills/ProviderSkills.tsx
++++ b/src/modules/skills/ProviderSkills.tsx
+@@ -54,12 +54,29 @@ const PROVIDER_NAMES: Record<SkillsProvider, string> = {
+   codex: 'Codex',
+   cursor: 'Cursor',
+   opencode: 'OpenCode',
++  pi: 'Pi',
+ };
+ 
+ const PROVIDER_SKILL_PATHS: Record<Exclude<SkillsProvider, 'opencode'>, string> = {
+   claude: '~/.claude/skills/<skill-name>/SKILL.md',
+   codex: '~/.agents/skills/<skill-name>/SKILL.md',
+   cursor: '~/.cursor/skills/<skill-name>/SKILL.md',
++  pi: '~/.pi/agent/skills/<skill-name>/SKILL.md',
++};
++
++/**
++ * Whether the backend accepts managed skill installs for a provider.
++ *
++ * Pi only discovers skills from disk (its own folder, settings-configured
++ * folders and the workspace's `.pi/skills`), so its page stays read-only: the
++ * backend rejects writes until pi exposes a writable skill home.
++ */
++const PROVIDER_SUPPORTS_SKILL_WRITES: Record<SkillsProvider, boolean> = {
++  claude: true,
++  codex: true,
++  cursor: true,
++  opencode: false,
++  pi: false,
+ };
+ 
+ const SCOPE_BADGE_CLASSES: Record<SkillsScope, string> = {
+@@ -207,6 +224,7 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
+ 
+   const providerName = PROVIDER_NAMES[selectedProvider];
+   const providerPath = selectedProvider === 'opencode' ? null : PROVIDER_SKILL_PATHS[selectedProvider];
++  const supportsSkillWrites = PROVIDER_SUPPORTS_SKILL_WRITES[selectedProvider];
+ 
+   useEffect(() => {
+     setQueuedFiles([]);
+@@ -507,7 +525,9 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
+         <div className="min-w-0 space-y-1">
+           <h3 className="text-lg font-medium text-foreground">{t('tabs.skills', { defaultValue: 'Skills' })}</h3>
+           <p className="text-sm text-muted-foreground">
+-            {t('skillsPage.description', { provider: providerName })}
++            {supportsSkillWrites
++              ? t('skillsPage.description', { provider: providerName })
++              : t('skillsPage.readOnlyDescription', { provider: providerName })}
+           </p>
+         </div>
+       </div>
+@@ -535,15 +555,17 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
+               </button>
+             )}
+           </div>
+-          <Button
+-            type="button"
+-            size="sm"
+-            className="w-full sm:w-auto"
+-            onClick={() => handleAddDialogOpenChange(true)}
+-          >
+-            <Plus className="h-4 w-4" />
+-            {t('skillsPage.addSkill')}
+-          </Button>
++          {supportsSkillWrites && (
++            <Button
++              type="button"
++              size="sm"
++              className="w-full sm:w-auto"
++              onClick={() => handleAddDialogOpenChange(true)}
++            >
++              <Plus className="h-4 w-4" />
++              {t('skillsPage.addSkill')}
++            </Button>
++          )}
+           <Button
+             onClick={() => void refreshSkills({ force: true })}
+             variant="outline"
+@@ -670,8 +692,15 @@ export default function ProviderSkills({ selectedProvider, currentProjects }: Pr
+             </div>
+             <div className="mt-4 text-sm font-medium text-foreground">{t('skillsPage.emptyTitle')}</div>
+             <div className="mt-1 text-sm text-muted-foreground">
+-              {t('skillsPage.emptyDescription')}
++              {supportsSkillWrites
++                ? t('skillsPage.emptyDescription')
++                : t('skillsPage.emptyReadOnlyDescription', { provider: providerName })}
+             </div>
++            {!supportsSkillWrites && providerPath && (
++              <code className="mx-auto mt-3 block max-w-md whitespace-normal break-all rounded-md border border-border/60 bg-muted/20 px-2 py-1 text-xs text-foreground">
++                {providerPath}
++              </code>
++            )}
+           </div>
+         )}
+ 
+diff --git a/src/modules/skills/tests/providerSkillsReadOnly.test.tsx b/src/modules/skills/tests/providerSkillsReadOnly.test.tsx
+new file mode 100644
+index 00000000..2f2a5a43
+--- /dev/null
++++ b/src/modules/skills/tests/providerSkillsReadOnly.test.tsx
+@@ -0,0 +1,66 @@
++import assert from 'node:assert/strict';
++
++import { render } from '@testing-library/react';
++import React from 'react';
++import { beforeEach, test, vi } from 'vitest';
++
++import type { SkillsProject } from '@/shared/types';
++
++/**
++ * Pi discovers skills from disk but has no writable skill home, so the backend
++ * rejects every managed install. The skills page must therefore hide the write
++ * affordance for read-only providers instead of offering an install that can
++ * only fail, while write-capable providers keep it.
++ */
++
++const useProviderSkillsMock = vi.fn();
++
++vi.mock('@/modules/skills/hooks/useProviderSkills', () => ({
++  useProviderSkills: (args: unknown) => useProviderSkillsMock(args),
++}));
++
++vi.mock('react-i18next', () => ({
++  useTranslation: () => ({
++    // Keys are asserted verbatim so this test stays independent of locale files.
++    t: (key: string) => key,
++  }),
++  Trans: () => null,
++}));
++
++const { default: ProviderSkills } = await import('@/modules/skills/ProviderSkills');
++
++const baseHookResult = {
++  skills: [],
++  isLoading: false,
++  isLoadingProjectScopes: false,
++  loadError: null,
++  saveStatus: null,
++  addSkills: vi.fn(),
++  refreshSkills: vi.fn(),
++};
++
++const currentProjects: SkillsProject[] = [];
++
++beforeEach(() => {
++  useProviderSkillsMock.mockReset().mockReturnValue({ ...baseHookResult });
++});
++
++test('pi renders a read-only skills page with no install affordance', () => {
++  const { container } = render(
++    <ProviderSkills selectedProvider="pi" currentProjects={currentProjects} />,
++  );
++
++  assert.equal(container.textContent?.includes('skillsPage.addSkill'), false);
++  assert.equal(container.textContent?.includes('skillsPage.readOnlyDescription'), true);
++  // The empty state points at a directory pi actually scans.
++  assert.equal(container.textContent?.includes('~/.pi/agent/skills/'), true);
++});
++
++test('write-capable providers keep the install affordance', () => {
++  const { container } = render(
++    <ProviderSkills selectedProvider="claude" currentProjects={currentProjects} />,
++  );
++
++  assert.equal(container.textContent?.includes('skillsPage.addSkill'), true);
++  assert.equal(container.textContent?.includes('skillsPage.readOnlyDescription'), false);
++});

@@ -1,0 +1,81 @@
+diff --git a/server/shared/types.ts b/server/shared/types.ts
+index 256ef2d4..1a78ee0e 100644
+--- a/server/shared/types.ts
++++ b/server/shared/types.ts
+@@ -66,7 +66,7 @@ export type AuthenticatedWebSocketRequest = IncomingMessage & {
+  * Use this as the source of truth whenever a function or payload needs to identify
+  * a specific LLM integration.
+  */
+-export type LLMProvider = 'claude' | 'codex' | 'cursor' | 'opencode';
++export type LLMProvider = 'claude' | 'codex' | 'cursor' | 'opencode' | 'pi';
+ 
+ /**
+  * One selectable model row in a provider model catalog.
+@@ -109,6 +109,29 @@ export type ProviderModelsDefinition = {
+    * Adapter catalogs omit it.
+    */
+   CUSTOM_MODELS_ONLY?: boolean;
++  /**
++   * Provider ids whose models were withheld from `OPTIONS` because they did not
++   * answer a reachability probe, not because the provider stopped offering
++   * them. Set only by adapters that discover their catalog at runtime and
++   * filter it by reachability (pi).
++   *
++   * Consumers must not read a model's absence from `OPTIONS` as "this model is
++   * gone" while its provider is listed here: a probe can fail for a transient
++   * reason (offline, gateway still starting, pi busy), and treating that as a
++   * permanent removal would rewrite a session's recorded model. Adapter
++   * catalogs omit it when they filtered nothing.
++   */
++  UNREACHABLE_PROVIDERS?: string[];
++  /**
++   * Built-in model ids this catalog hid because the user asked for their own
++   * models only.
++   *
++   * Set alongside `CUSTOM_MODELS_ONLY`. Without it, "not in `OPTIONS`" cannot be
++   * distinguished from "hidden by the user", and a caller would have to treat
++   * every unknown id as possibly hidden — which would also wave through ids the
++   * provider has actually dropped. Adapter catalogs omit it.
++   */
++  HIDDEN_BUILT_IN_MODELS?: string[];
+ };
+ 
+ /**
+diff --git a/server/shared/utils.ts b/server/shared/utils.ts
+index 20eb97d4..2c096fec 100644
+--- a/server/shared/utils.ts
++++ b/server/shared/utils.ts
+@@ -1089,6 +1089,33 @@ export function unwrapJsonStringLiteral(value: string): string {
+   }
+ }
+ 
++// ---------------------------
++//----------------- PI SESSION STORAGE UTILITIES ------------
++/**
++ * Resolves pi's agent directory: its settings, models, skills and sessions root.
++ *
++ * pi honours `PI_CODING_AGENT_DIR`, and everything pi itself reads — the model
++ * catalog, the credential store, the session tree — follows it. Resolving the
++ * default here instead would make CloudCLI read a directory pi is not using, so
++ * share this single resolver rather than joining the path at each call site.
++ */
++export function getPiAgentDir(): string {
++  const configured = process.env.PI_CODING_AGENT_DIR?.trim();
++  return configured || path.join(os.homedir(), '.pi', 'agent');
++}
++
++/**
++ * Resolves the Pi session directory.
++ *
++ * Pi writes one JSONL transcript per session under `<agent dir>/sessions`
++ * (grouped per project directory). Watchers and synchronizers should treat this
++ * path as read-only input and never store it as the deletable transcript path
++ * of an individual app session row.
++ */
++export function getPiSessionDir(): string {
++  return path.join(getPiAgentDir(), 'sessions');
++}
++
+ // ---------------------------
+ //----------------- JSONC UTILITIES ------------
+ /**

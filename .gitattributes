@@ -1,0 +1,6 @@
+# 补丁与源码快照保持原始换行，避免 git 自动转换破坏 git apply
+patches/** -text
+source/**  -text
+docs/**    text=auto
+*.md       text=auto
+LICENSE    -text
